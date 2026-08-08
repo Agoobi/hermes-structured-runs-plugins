@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+.env
+*.log
+.DS_Store
+structured_runs_state.json
