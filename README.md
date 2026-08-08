@@ -8,7 +8,7 @@ It does **not** patch or replace Hermes core. It forwards work to the real Herme
 
 - `POST /v1/runs/structured` — create a normal Hermes run, plus `json_schema` for the final response.
 - `GET /v1/runs/structured/{run_id}` — poll the upstream run and return `parsed` JSON once complete.
-- `GET /v1/runs/structured/{run_id}/events` — proxy upstream SSE events and emit a final `structured.completed` / `structured.failed` event.
+- `GET /v1/runs/structured/{run_id}/events` — proxy upstream SSE events, fall back to polling if upstream events are unavailable, and emit a final `structured.completed` / `structured.failed` event only when terminal.
 - `POST /v1/runs/structured/{run_id}/stop` — pass through to upstream run stop.
 - `POST /v1/runs/structured/{run_id}/approval` — pass through approval responses.
 - `GET /v1/runs/structured/{run_id}/media?path=...` — serve attached image/video/audio artifacts safely.

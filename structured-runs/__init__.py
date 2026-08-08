@@ -23,6 +23,7 @@ import copy
 import json
 import logging
 import os
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -36,6 +37,7 @@ logger = logging.getLogger(__name__)
 API_BASE = os.getenv("STRUCTURED_RUNS_UPSTREAM", "http://127.0.0.1:8642").rstrip("/")
 HERMES_HOME = Path(os.getenv("HERMES_HOME") or os.path.expanduser("~/.hermes"))
 STATE_FILE = HERMES_HOME / "structured_runs_state.json"
+STATE_DB = HERMES_HOME / "state.db"
 MAX_OUTPUT_CHARS = int(os.getenv("STRUCTURED_RUNS_MAX_OUTPUT_CHARS", "200000"))
 MEDIA_ROOTS = [
     Path(p).expanduser().resolve()
@@ -94,6 +96,87 @@ def _save_state() -> None:
         tmp.replace(STATE_FILE)
     except Exception:
         logger.exception("[structured-runs] Failed to save state file %s", STATE_FILE)
+
+
+def _session_recovery_snapshot(run_id: str) -> Optional[Dict[str, Any]]:
+    """Recover an upstream-like run snapshot from Hermes session DB.
+
+    /v1/runs status/events are an in-memory registry and can disappear while
+    the persistent API session still exists. This function lets the wrapper
+    finalize completed sessions and avoid false structured.failed events for
+    active/interrupted sessions.
+    """
+    if not STATE_DB.exists():
+        return None
+    try:
+        con = sqlite3.connect(str(STATE_DB))
+        con.row_factory = sqlite3.Row
+        session = con.execute(
+            "select id, ended_at, end_reason, message_count, input_tokens, output_tokens, last_activity_at, model from sessions where id=?",
+            (run_id,),
+        ).fetchone()
+        if not session:
+            return None
+        rows = con.execute(
+            """
+            select id, content, finish_reason, timestamp
+            from messages
+            where session_id=? and role='assistant' and active=1
+              and content is not null and trim(content) != ''
+            order by id desc
+            limit 20
+            """,
+            (run_id,),
+        ).fetchall()
+        final_content = None
+        final_message_id = None
+        interrupted = False
+        for row in rows:
+            content = row["content"] or ""
+            if content.startswith("Operation interrupted:"):
+                interrupted = True
+                continue
+            # Ignore tool-call placeholder assistant messages.
+            if row["finish_reason"] == "tool_calls":
+                continue
+            final_content = content
+            final_message_id = row["id"]
+            break
+
+        ended = session["ended_at"] is not None
+        if ended and final_content:
+            return {
+                "object": "hermes.run",
+                "run_id": run_id,
+                "status": "completed",
+                "session_id": run_id,
+                "model": session["model"],
+                "last_event": "session.recovered",
+                "output": final_content,
+                "usage": {
+                    "input_tokens": session["input_tokens"] or 0,
+                    "output_tokens": session["output_tokens"] or 0,
+                    "total_tokens": (session["input_tokens"] or 0) + (session["output_tokens"] or 0),
+                },
+                "session_recovered": True,
+                "session_final_message_id": final_message_id,
+            }
+
+        return {
+            "object": "hermes.run",
+            "run_id": run_id,
+            "status": "unknown",
+            "session_id": run_id,
+            "model": session["model"],
+            "last_event": "session.active_without_run_registry",
+            "session_recovered": True,
+            "session_active": not ended,
+            "session_interrupted": interrupted,
+            "structured_error": "upstream_run_registry_lost_but_session_exists",
+        }
+    except Exception:
+        logger.exception("[structured-runs] Failed to recover session snapshot for %s", run_id)
+        return None
 
 
 def _schema_error(schema: Any) -> Optional[str]:
@@ -397,6 +480,12 @@ def register(ctx):
                 cached["upstream_status_unavailable"] = True
                 cached["upstream_error"] = upstream
                 return web.json_response(_merge_structured(cached, meta), status=200)
+            recovered = _session_recovery_snapshot(run_id)
+            if recovered:
+                if recovered.get("status") == "completed" and meta:
+                    merged = await _finalize_structured(run_id, recovered)
+                    return web.json_response(merged, status=200)
+                return web.json_response(_merge_structured(recovered, meta), status=200)
             return web.json_response(upstream, status=status)
 
         if not meta:
@@ -474,32 +563,85 @@ def register(ctx):
         )
         await response.prepare(request)
 
+        upstream_events_ok = False
         try:
             timeout = ClientTimeout(total=None, sock_read=None)
             async with ClientSession(timeout=timeout) as session:
                 async with session.get(f"{API_BASE}/v1/runs/{run_id}/events", headers=headers) as upstream_resp:
                     if upstream_resp.status >= 400:
                         text = await upstream_resp.text()
+                        # Important: Hermes can return run_not_found for the
+                        # event stream while /v1/runs/{id} still exists and is
+                        # running. Do not surface this as a terminal failure;
+                        # fall back to polling below.
                         await response.write(
-                            f"event: error\ndata: {json.dumps({'error': text, 'status': upstream_resp.status})}\n\n".encode()
+                            f"event: proxy.fallback\ndata: {json.dumps({'reason': 'upstream_events_unavailable', 'status': upstream_resp.status, 'upstream_error': text})}\n\n".encode()
                         )
                     else:
+                        upstream_events_ok = True
                         async for chunk in upstream_resp.content.iter_chunked(4096):
                             if chunk:
                                 await response.write(chunk)
         except (ConnectionResetError, asyncio.CancelledError):
             return response
         except Exception as exc:
-            await response.write(f"event: proxy.error\ndata: {json.dumps({'error': str(exc)})}\n\n".encode())
+            await response.write(f"event: proxy.fallback\ndata: {json.dumps({'reason': 'upstream_events_exception', 'error': str(exc)})}\n\n".encode())
 
-        # After upstream stream ends, poll status and emit structured final event.
-        status, upstream = await _json_request("GET", f"/v1/runs/{run_id}", headers=_headers_from_request(request))
-        if status < 400:
-            merged = await _finalize_structured(run_id, upstream)
+        # After upstream stream ends (or if upstream events are unavailable),
+        # poll status until terminal. This prevents false structured.failed
+        # events for long-running runs whose SSE buffer is unavailable.
+        while True:
+            status, upstream = await _json_request("GET", f"/v1/runs/{run_id}", headers=_headers_from_request(request))
+            if status >= 400:
+                if status in {401, 403}:
+                    await response.write(
+                        f"event: structured.failed\ndata: {json.dumps({'run_id': run_id, 'structured_error': upstream})}\n\n".encode()
+                    )
+                    return response
+                with _STATE_LOCK:
+                    meta = copy.deepcopy(_runs.get(run_id))
+                if meta and meta.get("upstream_snapshot"):
+                    upstream = copy.deepcopy(meta["upstream_snapshot"])
+                    upstream["upstream_status_unavailable"] = True
+                else:
+                    recovered = _session_recovery_snapshot(run_id)
+                    if recovered:
+                        upstream = recovered
+                    else:
+                        await response.write(
+                            f"event: status\ndata: {json.dumps({'run_id': run_id, 'status': 'unknown', 'upstream_error': upstream})}\n\n".encode()
+                        )
+                        await asyncio.sleep(3)
+                        continue
+
+            upstream_status = upstream.get("status")
+            if upstream_status not in _TERMINAL:
+                await response.write(
+                    f"event: status\ndata: {json.dumps({'run_id': run_id, 'status': upstream_status, 'source': 'upstream_sse' if upstream_events_ok else 'poll_fallback'})}\n\n".encode()
+                )
+                await asyncio.sleep(3)
+                continue
+
+            if upstream_status == "completed":
+                merged = await _finalize_structured(run_id, upstream)
+            else:
+                with _STATE_LOCK:
+                    meta = _runs.get(run_id)
+                    if meta and not meta.get("structured_done"):
+                        meta["structured_done"] = True
+                        meta["structured_status"] = "skipped"
+                        meta["structured_error"] = f"upstream_{upstream_status}"
+                        meta["upstream_snapshot"] = copy.deepcopy(upstream)
+                        _save_state()
+                    merged = _merge_structured(upstream, meta)
+
             sstatus = merged.get("structured_status")
-            event_name = "structured.completed" if sstatus == "completed" else "structured.failed"
-            if sstatus == "skipped":
+            if sstatus == "completed":
+                event_name = "structured.completed"
+            elif sstatus == "skipped":
                 event_name = "structured.skipped"
+            else:
+                event_name = "structured.failed"
             payload = {
                 "run_id": run_id,
                 "upstream_status": merged.get("status"),
@@ -511,11 +653,7 @@ def register(ctx):
                 "structured_error": merged.get("structured_error"),
             }
             await response.write(f"event: {event_name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8"))
-        else:
-            await response.write(
-                f"event: structured.failed\ndata: {json.dumps({'run_id': run_id, 'structured_error': upstream})}\n\n".encode()
-            )
-        return response
+            return response
 
     async def stop_structured_run(request: web.Request):
         run_id = request.match_info["run_id"]
