@@ -11,6 +11,7 @@ It does **not** patch or replace Hermes core. It forwards work to the real Herme
 - `GET /v1/runs/structured/{run_id}/events` — proxy upstream SSE events, fall back to polling if upstream events are unavailable, and emit a final `structured.completed` / `structured.failed` event only when terminal.
 - `POST /v1/runs/structured/{run_id}/stop` — pass through to upstream run stop.
 - `POST /v1/runs/structured/{run_id}/approval` — pass through approval responses.
+- The finalizer first launches a **post-completion agent check in the same session**. The agent reviews the client JSON Schema and returns a corrected final answer before JSON extraction.
 - `GET /v1/runs/structured/{run_id}/media?path=...` — serve attached image/video/audio artifacts safely.
 
 ## Install
@@ -101,6 +102,20 @@ Example completed response:
 }
 ```
 
+## Post-completion output check
+
+Every successful structured run gets one additional, short agent turn in the **same Hermes session** before structured extraction. This is schema-agnostic: the plugin gives the agent the exact JSON Schema the client submitted and asks it to repair its final answer rather than merely confirm that it is correct.
+
+The reminder applies to every schema and explicitly requires created artifacts to be verified and emitted using `MEDIA:/absolute/path/to/file.ext`. This prevents a common failure mode where an agent mentions a relative file path but the structured finalizer cannot safely populate a path or media URL.
+
+The wrapper exposes the result in `final_output_check`, for example:
+
+```json
+{"status":"completed","run_id":"run_xxx"}
+```
+
+If the follow-up cannot start, fails, or exceeds its deadline, the wrapper preserves the original completed output and reports `{"status":"fallback","error":"..."}` in `final_output_check`; it never silently drops a valid upstream result.
+
 ## Media artifacts
 
 If the structured result contains a local media path, such as:
@@ -139,6 +154,8 @@ Environment variables:
 |---|---|---|
 | `STRUCTURED_RUNS_UPSTREAM` | `http://127.0.0.1:8642` | Upstream Hermes API server. |
 | `STRUCTURED_RUNS_MAX_OUTPUT_CHARS` | `200000` | Max raw output passed into the finalizer. |
+| `STRUCTURED_RUNS_FINAL_CHECK_TIMEOUT_S` | `120` | Maximum time for the post-completion agent correction turn. |
+| `STRUCTURED_RUNS_FINAL_CHECK_POLL_INTERVAL_S` | `1` | Seconds between status checks for that correction turn. |
 | `STRUCTURED_RUNS_MEDIA_ROOTS` | `/root/motion-graphic-templete,/root/.hermes,/tmp` | Comma-separated roots allowed for media serving. |
 
 State is persisted at:

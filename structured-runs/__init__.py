@@ -39,6 +39,8 @@ HERMES_HOME = Path(os.getenv("HERMES_HOME") or os.path.expanduser("~/.hermes"))
 STATE_FILE = HERMES_HOME / "structured_runs_state.json"
 STATE_DB = HERMES_HOME / "state.db"
 MAX_OUTPUT_CHARS = int(os.getenv("STRUCTURED_RUNS_MAX_OUTPUT_CHARS", "200000"))
+FINAL_CHECK_TIMEOUT_S = float(os.getenv("STRUCTURED_RUNS_FINAL_CHECK_TIMEOUT_S", "120"))
+FINAL_CHECK_POLL_INTERVAL_S = float(os.getenv("STRUCTURED_RUNS_FINAL_CHECK_POLL_INTERVAL_S", "1"))
 MEDIA_ROOTS = [
     Path(p).expanduser().resolve()
     for p in os.getenv(
@@ -206,6 +208,39 @@ def _validate_parsed(parsed: Any, schema: Dict[str, Any]) -> Optional[str]:
         return f"schema_validation_failed: {exc}"
 
 
+def _final_output_check_prompt(schema: Dict[str, Any]) -> str:
+    """Build a schema-aware, post-completion correction request for the agent.
+
+    This is deliberately sent as a follow-up API run in the same session after
+    the original work finishes. It does not assume a particular schema shape or
+    artifact type: every client-provided JSON Schema gets the same final-output
+    check, while artifact/file fields receive explicit MEDIA path guidance.
+    """
+    schema_text = json.dumps(schema, ensure_ascii=False, separators=(",", ":"))
+    return (
+        "BƯỚC KIỂM TRA OUTPUT CUỐI — BẮT BUỘC. Bạn vừa hoàn thành tác vụ ở lượt trước. "
+        "Hãy tự rà soát câu trả lời cuối theo JSON Schema của client bên dưới, rồi trả lại "
+        "MỘT câu trả lời cuối đã được sửa để finalizer có thể điền đúng mọi field bắt buộc. "
+        "Không chỉ xác nhận 'đã đúng' và không mô tả việc kiểm tra. "
+        "Nếu tác vụ tạo bất kỳ artifact nào (video, audio, image, PDF, DOCX, CSV, ZIP hoặc file khác), "
+        "hãy xác minh file tồn tại; dùng realpath nếu cần; và ghi đúng cú pháp "
+        "MEDIA:/absolute/path/to/file.ext. Tuyệt đối không chỉ trả relative path. "
+        "Nếu schema yêu cầu URL/path/file/media/artifact thì cung cấp bằng chứng rõ ràng tương ứng. "
+        "Không bịa giá trị: nếu một field bắt buộc không thể cung cấp, nói rõ lý do để structured finalizer "
+        "trả lỗi thay vì im lặng cho null thành công. Không thêm field ngoài schema.\n\n"
+        f"JSON Schema client gửi:\n{schema_text}"
+    )
+
+
+def _run_output_text(status: Dict[str, Any]) -> str:
+    output = status.get("output")
+    if output is None:
+        output = status.get("final_output") or status.get("result")
+    if output is None:
+        output = json.dumps(status, ensure_ascii=False)
+    return str(output)
+
+
 def _is_under(path: Path, root: Path) -> bool:
     try:
         path.relative_to(root)
@@ -290,6 +325,7 @@ def _merge_structured(upstream: Dict[str, Any], meta: Optional[Dict[str, Any]]) 
             "structured_usage": meta.get("structured_usage"),
             "structured_error": meta.get("structured_error"),
             "structured_schema_name": meta.get("schema_name"),
+            "final_output_check": meta.get("final_output_check"),
         }
     )
     return merged
@@ -326,7 +362,78 @@ def register(ctx):
                     data = {"raw": text}
                 return resp.status, data
 
-    async def _finalize_structured(run_id: str, upstream_status: Dict[str, Any]) -> Dict[str, Any]:
+    async def _post_completion_final_check(
+        run_id: str,
+        upstream_status: Dict[str, Any],
+        schema: Dict[str, Any],
+        headers: Dict[str, str],
+    ) -> Tuple[str, Dict[str, Any]]:
+        """Ask the completed upstream agent to produce a corrected final answer.
+
+        The follow-up uses the same Hermes session as the original `/v1/runs`
+        call. This makes the user-requested check an actual agent turn after
+        completion, not merely an LLM finalizer instruction. A failed/expired
+        follow-up falls back to the original output so it cannot erase a valid
+        completed run.
+        """
+        original_output = _run_output_text(upstream_status)
+        session_id = upstream_status.get("session_id") or run_id
+        prompt = _final_output_check_prompt(schema)
+        prompt += "\n\nCâu trả lời cuối trước khi kiểm tra:\n" + original_output[:MAX_OUTPUT_CHARS]
+        followup_headers = dict(headers)
+        followup_headers["Content-Type"] = "application/json"
+        status, started = await _json_request(
+            "POST",
+            "/v1/runs",
+            headers=followup_headers,
+            body={"input": prompt, "session_id": session_id},
+            timeout_s=30,
+        )
+        if status >= 400 or not started.get("run_id"):
+            return original_output, {
+                "status": "fallback",
+                "error": f"final_output_check_start_failed: {started}",
+            }
+
+        check_run_id = str(started["run_id"])
+        deadline = _now() + FINAL_CHECK_TIMEOUT_S
+        while _now() < deadline:
+            status, checked = await _json_request(
+                "GET", f"/v1/runs/{check_run_id}", headers=headers, timeout_s=30
+            )
+            if status >= 400:
+                return original_output, {
+                    "status": "fallback",
+                    "run_id": check_run_id,
+                    "error": f"final_output_check_poll_failed: {checked}",
+                }
+            checked_status = checked.get("status")
+            if checked_status == "completed":
+                checked_output = _run_output_text(checked)
+                if checked_output.strip():
+                    return checked_output, {"status": "completed", "run_id": check_run_id}
+                return original_output, {
+                    "status": "fallback",
+                    "run_id": check_run_id,
+                    "error": "final_output_check_returned_empty_output",
+                }
+            if checked_status in {"failed", "cancelled"}:
+                return original_output, {
+                    "status": "fallback",
+                    "run_id": check_run_id,
+                    "error": f"final_output_check_{checked_status}",
+                }
+            await asyncio.sleep(FINAL_CHECK_POLL_INTERVAL_S)
+
+        return original_output, {
+            "status": "fallback",
+            "run_id": check_run_id,
+            "error": "final_output_check_timeout",
+        }
+
+    async def _finalize_structured(
+        run_id: str, upstream_status: Dict[str, Any], headers: Dict[str, str]
+    ) -> Dict[str, Any]:
         with _STATE_LOCK:
             meta = _runs.get(run_id)
             if not meta:
@@ -351,17 +458,18 @@ def register(ctx):
                 _runs[run_id]["upstream_snapshot"] = copy.deepcopy(upstream_status)
                 _save_state()
 
-        output = upstream_status.get("output")
-        if output is None:
-            output = upstream_status.get("final_output") or upstream_status.get("result")
-        if output is None:
-            output = json.dumps(upstream_status, ensure_ascii=False)
-        output_text = str(output)
-        if len(output_text) > MAX_OUTPUT_CHARS:
-            output_text = output_text[:MAX_OUTPUT_CHARS]
-
         schema = meta["json_schema"]
         schema_name = meta.get("schema_name") or "run.finalizer"
+        logger.info("[structured-runs] Running post-completion output check for %s", run_id)
+        output_text, final_check = await _post_completion_final_check(
+            run_id, upstream_status, schema, headers
+        )
+        if len(output_text) > MAX_OUTPUT_CHARS:
+            output_text = output_text[:MAX_OUTPUT_CHARS]
+        with _STATE_LOCK:
+            if run_id in _runs:
+                _runs[run_id]["final_output_check"] = final_check
+                _save_state()
         logger.info("[structured-runs] Finalizing %s using schema=%s", run_id, schema_name)
 
         try:
@@ -483,7 +591,7 @@ def register(ctx):
             recovered = _session_recovery_snapshot(run_id)
             if recovered:
                 if recovered.get("status") == "completed" and meta:
-                    merged = await _finalize_structured(run_id, recovered)
+                    merged = await _finalize_structured(run_id, recovered, headers)
                     return web.json_response(merged, status=200)
                 return web.json_response(_merge_structured(recovered, meta), status=200)
             return web.json_response(upstream, status=status)
@@ -496,7 +604,7 @@ def register(ctx):
             return web.json_response(upstream, status=status)
 
         if upstream.get("status") == "completed":
-            merged = await _finalize_structured(run_id, upstream)
+            merged = await _finalize_structured(run_id, upstream, headers)
             return web.json_response(merged, status=status)
 
         if upstream.get("status") in {"failed", "cancelled"}:
@@ -623,7 +731,7 @@ def register(ctx):
                 continue
 
             if upstream_status == "completed":
-                merged = await _finalize_structured(run_id, upstream)
+                merged = await _finalize_structured(run_id, upstream, headers)
             else:
                 with _STATE_LOCK:
                     meta = _runs.get(run_id)
