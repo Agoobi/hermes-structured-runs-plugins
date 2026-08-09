@@ -761,6 +761,9 @@ def register(ctx):
                 cached = copy.deepcopy(meta["upstream_snapshot"])
                 cached["upstream_status_unavailable"] = True
                 cached["upstream_error"] = upstream
+                if cached.get("status") == "completed" and not meta.get("structured_done"):
+                    merged = await _finalize_structured(run_id, cached, headers)
+                    return web.json_response(merged, status=200)
                 return web.json_response(_merge_structured(cached, meta), status=200)
             recovered = _session_recovery_snapshot(run_id)
             if recovered:
