@@ -104,9 +104,9 @@ Example completed response:
 
 ## Post-completion output check
 
-Every successful structured run gets one additional, short agent turn in the **same Hermes session** before structured extraction. This is schema-agnostic: the plugin gives the agent the exact JSON Schema the client submitted and asks it to repair its final answer rather than merely confirm that it is correct.
+Every successful structured run first waits for its own background delegations to complete and be delivered, then takes the newest persisted assistant reply from the same session. This avoids freezing an early final answer while QA or other `delegate_task` work is still returning.
 
-The reminder applies to every schema and explicitly requires created artifacts to be verified and emitted using `MEDIA:/absolute/path/to/file.ext`. This prevents a common failure mode where an agent mentions a relative file path but the structured finalizer cannot safely populate a path or media URL.
+The wrapper also resolves any artifact path mentioned in that reply against `STRUCTURED_RUNS_MEDIA_ROOTS` **before** starting the post-completion agent check. Verified paths are passed to the agent as authoritative absolute paths, so a later follow-up is never dependent on the gateway's current working directory. The finalizer canonicalizes existing `*_path` values to bare absolute paths; `MEDIA:` remains a delivery marker, not the value stored in JSON.
 
 The wrapper exposes the result in `final_output_check`, for example:
 
@@ -156,6 +156,9 @@ Environment variables:
 | `STRUCTURED_RUNS_MAX_OUTPUT_CHARS` | `200000` | Max raw output passed into the finalizer. |
 | `STRUCTURED_RUNS_FINAL_CHECK_TIMEOUT_S` | `120` | Maximum time for the post-completion agent correction turn. |
 | `STRUCTURED_RUNS_FINAL_CHECK_POLL_INTERVAL_S` | `1` | Seconds between status checks for that correction turn. |
+| `STRUCTURED_RUNS_SESSION_SETTLE_TIMEOUT_S` | `180` | Max wait for this session's background delegations/delivery before finalization. |
+| `STRUCTURED_RUNS_SESSION_QUIET_S` | `3` | Required quiet window after delegated output delivery. |
+| `STRUCTURED_RUNS_SESSION_SETTLE_POLL_INTERVAL_S` | `1` | Seconds between durable delegation-state checks. |
 | `STRUCTURED_RUNS_MEDIA_ROOTS` | `/root/motion-graphic-templete,/root/.hermes,/tmp` | Comma-separated roots allowed for media serving. |
 
 State is persisted at:

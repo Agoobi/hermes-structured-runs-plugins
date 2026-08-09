@@ -23,11 +23,12 @@ import copy
 import json
 import logging
 import os
+import re
 import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
 from aiohttp import ClientSession, ClientTimeout, web
@@ -41,6 +42,13 @@ STATE_DB = HERMES_HOME / "state.db"
 MAX_OUTPUT_CHARS = int(os.getenv("STRUCTURED_RUNS_MAX_OUTPUT_CHARS", "200000"))
 FINAL_CHECK_TIMEOUT_S = float(os.getenv("STRUCTURED_RUNS_FINAL_CHECK_TIMEOUT_S", "120"))
 FINAL_CHECK_POLL_INTERVAL_S = float(os.getenv("STRUCTURED_RUNS_FINAL_CHECK_POLL_INTERVAL_S", "1"))
+SESSION_SETTLE_TIMEOUT_S = float(os.getenv("STRUCTURED_RUNS_SESSION_SETTLE_TIMEOUT_S", "180"))
+SESSION_QUIET_S = float(os.getenv("STRUCTURED_RUNS_SESSION_QUIET_S", "3"))
+SESSION_SETTLE_POLL_INTERVAL_S = float(os.getenv("STRUCTURED_RUNS_SESSION_SETTLE_POLL_INTERVAL_S", "1"))
+_MEDIA_PATH_RE = re.compile(
+    r"(?:MEDIA:)?(?:(?:/|~?/)?(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+\.(?:mp4|mov|mkv|webm|mp3|wav|m4a|ogg|png|jpe?g|webp|gif|pdf|docx|xlsx|csv|zip))",
+    re.IGNORECASE,
+)
 MEDIA_ROOTS = [
     Path(p).expanduser().resolve()
     for p in os.getenv(
@@ -181,6 +189,74 @@ def _session_recovery_snapshot(run_id: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _session_work_state(run_id: str) -> Dict[str, Any]:
+    """Return whether delegated work or delivery is still pending for a session."""
+    if not STATE_DB.exists():
+        return {"available": False, "pending_delegations": 0, "pending_delivery": 0, "last_activity_at": None}
+    try:
+        con = sqlite3.connect(str(STATE_DB))
+        try:
+            session = con.execute(
+                "select last_activity_at from sessions where id=?", (run_id,)
+            ).fetchone()
+            rows = con.execute(
+                """
+                select state, delivery_state
+                from async_delegations
+                where origin_session=? or parent_session_id=? or origin_session_id=?
+                """,
+                (run_id, run_id, run_id),
+            ).fetchall()
+            pending_delegations = sum(
+                1 for state, _ in rows if state not in {"completed", "failed", "cancelled"}
+            )
+            pending_delivery = sum(
+                1
+                for state, delivery_state in rows
+                if state in {"completed", "failed", "cancelled"} and delivery_state != "delivered"
+            )
+            return {
+                "available": True,
+                "pending_delegations": pending_delegations,
+                "pending_delivery": pending_delivery,
+                "last_activity_at": session[0] if session else None,
+            }
+        finally:
+            con.close()
+    except Exception:
+        logger.debug("[structured-runs] Could not inspect delegated work for %s", run_id, exc_info=True)
+        return {"available": False, "pending_delegations": 0, "pending_delivery": 0, "last_activity_at": None}
+
+
+def _latest_session_output(run_id: str) -> Optional[Dict[str, Any]]:
+    """Return the newest non-tool assistant reply persisted for this session."""
+    if not STATE_DB.exists():
+        return None
+    try:
+        con = sqlite3.connect(str(STATE_DB))
+        con.row_factory = sqlite3.Row
+        try:
+            row = con.execute(
+                """
+                select id, content, timestamp
+                from messages
+                where session_id=? and role='assistant' and active=1
+                  and content is not null and trim(content) != ''
+                  and (finish_reason is null or finish_reason != 'tool_calls')
+                order by id desc limit 1
+                """,
+                (run_id,),
+            ).fetchone()
+            if not row:
+                return None
+            return {"message_id": row["id"], "output": row["content"], "timestamp": row["timestamp"]}
+        finally:
+            con.close()
+    except Exception:
+        logger.debug("[structured-runs] Could not read latest output for %s", run_id, exc_info=True)
+        return None
+
+
 def _schema_error(schema: Any) -> Optional[str]:
     if not isinstance(schema, dict):
         return "json_schema must be a JSON object"
@@ -208,7 +284,7 @@ def _validate_parsed(parsed: Any, schema: Dict[str, Any]) -> Optional[str]:
         return f"schema_validation_failed: {exc}"
 
 
-def _final_output_check_prompt(schema: Dict[str, Any]) -> str:
+def _final_output_check_prompt(schema: Dict[str, Any], verified_artifacts: Optional[List[str]] = None) -> str:
     """Build a schema-aware, post-completion correction request for the agent.
 
     This is deliberately sent as a follow-up API run in the same session after
@@ -217,19 +293,27 @@ def _final_output_check_prompt(schema: Dict[str, Any]) -> str:
     check, while artifact/file fields receive explicit MEDIA path guidance.
     """
     schema_text = json.dumps(schema, ensure_ascii=False, separators=(",", ":"))
-    return (
+    prompt = (
         "BƯỚC KIỂM TRA OUTPUT CUỐI — BẮT BUỘC. Bạn vừa hoàn thành tác vụ ở lượt trước. "
         "Hãy tự rà soát câu trả lời cuối theo JSON Schema của client bên dưới, rồi trả lại "
         "MỘT câu trả lời cuối đã được sửa để finalizer có thể điền đúng mọi field bắt buộc. "
         "Không chỉ xác nhận 'đã đúng' và không mô tả việc kiểm tra. "
         "Nếu tác vụ tạo bất kỳ artifact nào (video, audio, image, PDF, DOCX, CSV, ZIP hoặc file khác), "
-        "hãy xác minh file tồn tại; dùng realpath nếu cần; và ghi đúng cú pháp "
-        "MEDIA:/absolute/path/to/file.ext. Tuyệt đối không chỉ trả relative path. "
-        "Nếu schema yêu cầu URL/path/file/media/artifact thì cung cấp bằng chứng rõ ràng tương ứng. "
-        "Không bịa giá trị: nếu một field bắt buộc không thể cung cấp, nói rõ lý do để structured finalizer "
-        "trả lỗi thay vì im lặng cho null thành công. Không thêm field ngoài schema.\n\n"
+        "hãy xác minh file tồn tại. Nếu wrapper đã liệt kê ARTIFACT ĐÃ XÁC MINH bên dưới, "
+        "hãy dùng chính absolute path đó; không chạy realpath cho relative path từ cwd khác. "
+        "Trong JSON field có tên kết thúc bằng _path, dùng bare absolute path, KHÔNG thêm prefix MEDIA:. "
+        "Chỉ dùng MEDIA:/absolute/path/to/file.ext ở phần text delivery ngoài JSON. "
+        "Tuyệt đối không chỉ trả relative path. Nếu schema yêu cầu URL/path/file/media/artifact thì "
+        "cung cấp bằng chứng rõ ràng tương ứng. Không bịa giá trị: nếu một field bắt buộc không thể "
+        "cung cấp, nói rõ lý do để structured finalizer trả lỗi thay vì im lặng cho null thành công. "
+        "Không thêm field ngoài schema.\n\n"
         f"JSON Schema client gửi:\n{schema_text}"
     )
+    if verified_artifacts:
+        prompt += "\n\nARTIFACT ĐÃ XÁC MINH BỞI WRAPPER (authoritative):\n" + "\n".join(
+            f"- {path}" for path in verified_artifacts
+        )
+    return prompt
 
 
 def _run_output_text(status: Dict[str, Any]) -> str:
@@ -250,13 +334,17 @@ def _is_under(path: Path, root: Path) -> bool:
 
 
 def _resolve_media_path(raw_path: str) -> Optional[Path]:
-    """Resolve a user/run-produced media path without allowing path traversal.
+    """Resolve a run-produced artifact path without allowing traversal.
 
-    Absolute paths must be under MEDIA_ROOTS. Relative paths are tried under
-    each MEDIA_ROOTS entry. Only existing regular files are returned.
+    `MEDIA:/...` is accepted as an input transport marker, but callers receive
+    only the canonical filesystem path. Relative paths are resolved against the
+    explicit allowed roots, not the gateway process cwd.
     """
     if not raw_path or "\x00" in raw_path:
         return None
+    raw_path = raw_path.strip()
+    if raw_path.startswith("MEDIA:"):
+        raw_path = raw_path[len("MEDIA:"):]
     p = Path(raw_path).expanduser()
     candidates = []
     if p.is_absolute():
@@ -274,6 +362,37 @@ def _resolve_media_path(raw_path: str) -> Optional[Path]:
         if any(_is_under(candidate, root) for root in MEDIA_ROOTS):
             return candidate
     return None
+
+
+def _verified_artifacts_from_text(text: str) -> List[str]:
+    """Find existing artifacts mentioned in agent output and canonicalize them.
+
+    This is deliberately evidence-based: a value is returned only if it both
+    appears in the agent output and resolves to an existing regular file under
+    an allowed root. It makes a relative path independent of an agent's later
+    working directory.
+    """
+    found: List[str] = []
+    for match in _MEDIA_PATH_RE.finditer(text or ""):
+        resolved = _resolve_media_path(match.group(0))
+        if resolved:
+            value = str(resolved)
+            if value not in found:
+                found.append(value)
+    return found
+
+
+def _canonicalize_artifact_paths(parsed: Any) -> Any:
+    """Normalize only existing `*_path` values to safe absolute paths."""
+    if not isinstance(parsed, dict):
+        return parsed
+    out = dict(parsed)
+    for key, value in out.items():
+        if key.endswith("_path") and isinstance(value, str):
+            resolved = _resolve_media_path(value)
+            if resolved:
+                out[key] = str(resolved)
+    return out
 
 
 def _media_url_for(run_id: str, media_path: str) -> str:
@@ -326,6 +445,8 @@ def _merge_structured(upstream: Dict[str, Any], meta: Optional[Dict[str, Any]]) 
             "structured_error": meta.get("structured_error"),
             "structured_schema_name": meta.get("schema_name"),
             "final_output_check": meta.get("final_output_check"),
+            "session_settle": meta.get("session_settle"),
+            "verified_artifacts": meta.get("verified_artifacts", []),
         }
     )
     return merged
@@ -362,11 +483,39 @@ def register(ctx):
                     data = {"raw": text}
                 return resp.status, data
 
+    async def _wait_for_session_settle(run_id: str) -> Dict[str, Any]:
+        """Wait for delegated work delivery and a brief quiet window.
+
+        `/v1/runs` can report completed while a background `delegate_task` is
+        still delivering its result to the same session. Finalizing immediately
+        would capture a stale assistant reply. We wait only for the session's
+        own durable delegation records, with a bounded timeout.
+        """
+        deadline = _now() + SESSION_SETTLE_TIMEOUT_S
+        last_state: Dict[str, Any] = {}
+        while _now() < deadline:
+            state = _session_work_state(run_id)
+            last_state = state
+            last_activity = state.get("last_activity_at")
+            quiet = (
+                last_activity is None
+                or _now() - float(last_activity) >= SESSION_QUIET_S
+            )
+            if (
+                state.get("pending_delegations", 0) == 0
+                and state.get("pending_delivery", 0) == 0
+                and quiet
+            ):
+                return {"status": "settled", **state}
+            await asyncio.sleep(SESSION_SETTLE_POLL_INTERVAL_S)
+        return {"status": "timeout", **last_state}
+
     async def _post_completion_final_check(
         run_id: str,
         upstream_status: Dict[str, Any],
         schema: Dict[str, Any],
         headers: Dict[str, str],
+        verified_artifacts: Optional[List[str]] = None,
     ) -> Tuple[str, Dict[str, Any]]:
         """Ask the completed upstream agent to produce a corrected final answer.
 
@@ -378,7 +527,7 @@ def register(ctx):
         """
         original_output = _run_output_text(upstream_status)
         session_id = upstream_status.get("session_id") or run_id
-        prompt = _final_output_check_prompt(schema)
+        prompt = _final_output_check_prompt(schema, verified_artifacts)
         prompt += "\n\nCâu trả lời cuối trước khi kiểm tra:\n" + original_output[:MAX_OUTPUT_CHARS]
         followup_headers = dict(headers)
         followup_headers["Content-Type"] = "application/json"
@@ -448,27 +597,51 @@ def register(ctx):
             meta["structured_started_at"] = _now()
             _save_state()
 
-        # Persist the upstream terminal snapshot before finalizing. Hermes keeps
+        # A terminal /v1/runs state can precede delivery of background
+        # delegation results. Wait for durable delegation delivery, then read
+        # the latest persisted assistant reply rather than freezing the first
+        # terminal response.
+        settle = await _wait_for_session_settle(run_id)
+        latest_output = _latest_session_output(run_id)
+        if latest_output and latest_output.get("output"):
+            upstream_status = dict(upstream_status)
+            upstream_status["output"] = latest_output["output"]
+            upstream_status["last_event"] = "session.settled"
+            upstream_status["session_final_message_id"] = latest_output["message_id"]
+
+        # Persist the settled terminal snapshot before finalizing. Hermes keeps
         # run statuses only briefly; after gateway restart or retention expiry
         # /v1/runs/{id} may return 404 while this wrapper still has the schema
         # and final structured result. Keeping the terminal snapshot lets poll
         # remain useful and deterministic.
         with _STATE_LOCK:
             if run_id in _runs:
+                _runs[run_id]["session_settle"] = settle
                 _runs[run_id]["upstream_snapshot"] = copy.deepcopy(upstream_status)
                 _save_state()
 
         schema = meta["json_schema"]
         schema_name = meta.get("schema_name") or "run.finalizer"
-        logger.info("[structured-runs] Running post-completion output check for %s", run_id)
-        output_text, final_check = await _post_completion_final_check(
-            run_id, upstream_status, schema, headers
+        original_output = _run_output_text(upstream_status)
+        verified_artifacts = _verified_artifacts_from_text(original_output)
+        logger.info(
+            "[structured-runs] Running post-completion output check for %s (artifacts=%d)",
+            run_id,
+            len(verified_artifacts),
         )
+        output_text, final_check = await _post_completion_final_check(
+            run_id, upstream_status, schema, headers, verified_artifacts
+        )
+        if verified_artifacts:
+            output_text += "\n\nARTIFACT ĐÃ XÁC MINH BỞI WRAPPER:\n" + "\n".join(
+                f"- {path}" for path in verified_artifacts
+            )
         if len(output_text) > MAX_OUTPUT_CHARS:
             output_text = output_text[:MAX_OUTPUT_CHARS]
         with _STATE_LOCK:
             if run_id in _runs:
                 _runs[run_id]["final_output_check"] = final_check
+                _runs[run_id]["verified_artifacts"] = verified_artifacts
                 _save_state()
         logger.info("[structured-runs] Finalizing %s using schema=%s", run_id, schema_name)
 
@@ -488,7 +661,8 @@ def register(ctx):
                 purpose="structured-runs.finalizer",
                 temperature=0.0,
             )
-            parsed = _enrich_media_urls(run_id, result.parsed)
+            parsed = _canonicalize_artifact_paths(result.parsed)
+            parsed = _enrich_media_urls(run_id, parsed)
             validation_error = _validate_parsed(parsed, schema)
             with _STATE_LOCK:
                 meta = _runs[run_id]
