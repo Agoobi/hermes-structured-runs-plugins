@@ -211,6 +211,40 @@ async def _extract_json(
     return {"parsed": parsed, "validation_error": validation_error, "result": result, "exc": None}
 
 
+def _extracted_text_length(value: Any) -> int:
+    """Sum the length of every string found in ``value``, recursing into
+    dicts/lists. Used to estimate how much of the source survived extraction."""
+    if isinstance(value, str):
+        return len(value)
+    if isinstance(value, dict):
+        return sum(_extracted_text_length(v) for v in value.values())
+    if isinstance(value, list):
+        return sum(_extracted_text_length(v) for v in value)
+    return 0
+
+
+def _looks_hollow(parsed: Any, original_output: str) -> bool:
+    """True when ``parsed`` reproduces too little of a substantial source.
+
+    A schema like ``{"content": {"type": "string"}}`` with no ``minLength``
+    lets the finalizer LLM return ``""`` for a field it was asked to copy
+    near-verbatim from a long ``original_output`` (observed live on a
+    multi-thousand-word article schema: base run + finalizer both reported
+    ``completed``, but every parsed string field came back blank). Schema
+    validation alone can't tell "legitimately short" from "silently dropped
+    most of the source", so cross-check length against the source instead.
+
+    Only fires once the source is long enough that "legitimately short field
+    values" isn't a plausible explanation -- a genuinely brief
+    ``original_output`` (short answers, tool-call summaries, etc.) is left
+    alone so this never second-guesses a normal small-schema run.
+    """
+    source_len = len(original_output)
+    if source_len < cfg.HOLLOW_EXTRACTION_MIN_SOURCE_CHARS:
+        return False
+    return _extracted_text_length(parsed) < source_len * cfg.HOLLOW_EXTRACTION_MAX_RATIO
+
+
 # In-flight finalizer tasks, keyed by run_id. The tasks are owned by the plugin
 # event loop rather than by the request that started them, so a client hanging
 # up mid-poll cannot cancel finalization and strand a run at "running".
@@ -430,6 +464,7 @@ async def _finalize_once(
             extract["exc"] is None
             and schema_mod.validation_available()
             and extract["validation_error"] is None
+            and not _looks_hollow(extract["parsed"], original_output)
         )
         if mode == "off" or first_pass_ok:
             final_check = {
@@ -471,6 +506,17 @@ async def _finalize_once(
     validation_error = extract.get("validation_error")
     result = extract.get("result")
     exc = extract.get("exc")
+    # Still hollow after the post-completion re-check (or "auto" skipped the
+    # re-check because this exact check hadn't flagged the first pass as
+    # bad -- can't happen now, but "always" mode never runs the fast path at
+    # all, so this is the only gate it gets). Fail explicitly instead of
+    # silently completing on an empty/near-empty result. "off" mode commits
+    # the first pass no matter what, by design.
+    if exc is None and validation_error is None and mode != "off" and _looks_hollow(parsed, original_output):
+        validation_error = (
+            f"finalizer_returned_hollow_extraction: parsed carried "
+            f"{_extracted_text_length(parsed)} of {len(original_output)} source chars"
+        )
     with _state.LOCK:
         meta = _state.runs.get(run_id)
         if meta:

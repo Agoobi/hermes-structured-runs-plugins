@@ -17,6 +17,17 @@ STATE_FILE = HERMES_HOME / "structured_runs_state.json"
 STATE_DB = HERMES_HOME / "state.db"
 
 MAX_OUTPUT_CHARS = int(os.getenv("STRUCTURED_RUNS_MAX_OUTPUT_CHARS", "200000"))
+# A finalizer extraction that is schema-valid but reproduces almost none of a
+# substantial `original_output` is treated as a failed extraction rather than
+# a legitimate result (see structured-runs/_finalize.py::_looks_hollow). Only
+# fires once the source is at least this long, so short answers -- where a
+# small parsed payload is completely normal -- are never second-guessed.
+HOLLOW_EXTRACTION_MIN_SOURCE_CHARS = int(
+    os.getenv("STRUCTURED_RUNS_HOLLOW_EXTRACTION_MIN_SOURCE_CHARS", "500")
+)
+HOLLOW_EXTRACTION_MAX_RATIO = float(
+    os.getenv("STRUCTURED_RUNS_HOLLOW_EXTRACTION_MAX_RATIO", "0.1")
+)
 # How the post-completion agent re-check ("BƯỚC KIỂM TRA OUTPUT CUỐI") is used:
 #   auto   - finalize the agent's own output first; only run the re-check when
 #            that first pass is not schema-valid  (default)

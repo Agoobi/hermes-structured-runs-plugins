@@ -127,8 +127,10 @@ Every successful structured run first waits for its own background delegations t
 
 Then the wrapper tries to finalize **the agent's own output** into schema-valid JSON:
 
-- If that first pass is schema-valid (and `jsonschema` is installed), the run completes there. `final_output_check` is `{"status":"skipped","reason":"first_pass_schema_valid"}` — no extra agent turn is spent.
-- If it is **not** schema-valid, the wrapper runs a **post-completion agent turn in the same session**: the agent reviews the client JSON Schema and returns a corrected final answer, which is then finalized. `final_output_check` is `{"status":"completed","run_id":"run_yyy"}`.
+- If that first pass is schema-valid **and not hollow** (see below) — and `jsonschema` is installed — the run completes there. `final_output_check` is `{"status":"skipped","reason":"first_pass_schema_valid"}` — no extra agent turn is spent.
+- If it is **not** schema-valid, or is hollow, the wrapper runs a **post-completion agent turn in the same session**: the agent reviews the client JSON Schema and returns a corrected final answer, which is then finalized. `final_output_check` is `{"status":"completed","run_id":"run_yyy"}`.
+
+**Hollow extraction:** a first pass can be schema-valid and still worthless — e.g. `content: {"type": "string"}` satisfied by `""`. Once the run's raw `output` is at least `STRUCTURED_RUNS_HOLLOW_EXTRACTION_MIN_SOURCE_CHARS` (default `500`) long, the finalizer requires the total extracted string content to be at least `STRUCTURED_RUNS_HOLLOW_EXTRACTION_MAX_RATIO` (default `0.1`, i.e. 10%) of that length, or the pass doesn't count as valid — this is what escalates it to the post-completion re-check above. If the result is still hollow after the re-check, the run ends at `structured_status: "failed"` with `structured_error: "finalizer_returned_hollow_extraction: parsed carried N of M source chars"` instead of silently completing on an empty result. `STRUCTURED_RUNS_FINAL_CHECK_MODE=off` is exempt — it always commits the first pass as-is (see below).
 
 `STRUCTURED_RUNS_FINAL_CHECK_MODE` overrides this: `always` runs the agent turn on every completed run (legacy behavior); `off` never runs it and commits the first-pass result as-is (`{"status":"skipped","reason":"final_check_disabled"}`).
 
@@ -211,7 +213,9 @@ Environment variables:
 |---|---|---|
 | `STRUCTURED_RUNS_UPSTREAM` | `http://127.0.0.1:8642` | Upstream Hermes API server. |
 | `STRUCTURED_RUNS_MAX_OUTPUT_CHARS` | `200000` | Max raw output passed into the finalizer. |
-| `STRUCTURED_RUNS_FINAL_CHECK_MODE` | `auto` | When the post-completion agent re-check runs: `auto` = only when finalizing the agent's own output is not schema-valid; `always` = every completed run (legacy); `off` = never. |
+| `STRUCTURED_RUNS_HOLLOW_EXTRACTION_MIN_SOURCE_CHARS` | `500` | Below this `output` length, a small/empty `parsed` is never flagged hollow — short answers are left alone. |
+| `STRUCTURED_RUNS_HOLLOW_EXTRACTION_MAX_RATIO` | `0.1` | Minimum fraction of `output`'s length the extracted text must reach, once past the char floor above, or the pass counts as hollow. |
+| `STRUCTURED_RUNS_FINAL_CHECK_MODE` | `auto` | When the post-completion agent re-check runs: `auto` = only when finalizing the agent's own output is not schema-valid or is hollow; `always` = every completed run (legacy); `off` = never. |
 | `STRUCTURED_RUNS_FINAL_CHECK_TIMEOUT_S` | `120` | Maximum time for the post-completion agent correction turn. |
 | `STRUCTURED_RUNS_FINAL_CHECK_POLL_INTERVAL_S` | `1` | Seconds between status checks for that correction turn. |
 | `STRUCTURED_RUNS_SESSION_SETTLE_TIMEOUT_S` | `180` | Max wait for this session's background delegations/delivery before finalization. |
