@@ -1,4 +1,4 @@
 name: structured-runs
-version: 1.2.0
+version: 1.3.0
 description: Hermes /v1/runs wrapper with JSON Schema finalizer and authenticated media routes
 provides_commands: []
