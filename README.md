@@ -25,8 +25,8 @@ relative imports.
 ## What it adds
 
 - `POST /v1/runs/structured` — create a normal Hermes run, plus `json_schema` for the final response.
-- `GET /v1/runs/structured/{run_id}` — poll the upstream run and return `parsed` JSON once complete.
-- `GET /v1/runs/structured/{run_id}/events` — proxy upstream SSE events, fall back to polling if upstream events are unavailable, and emit a final `structured.completed` / `structured.failed` / `structured.skipped` event only when terminal. If upstream never has a record of the run and no session can be recovered, the poll-fallback gives up after `STRUCTURED_RUNS_SSE_UNKNOWN_TIMEOUT_S` with `structured.failed` (`structured_error: "run_not_found_upstream"`) instead of polling forever.
+- `GET /v1/runs/structured/{run_id}` — poll the upstream run and return `parsed` JSON once complete. The poll never blocks longer than `STRUCTURED_RUNS_POLL_FINALIZE_WAIT_S` on an in-flight finalizer; it answers `structured_status: "running"` and the next poll collects the result.
+- `GET /v1/runs/structured/{run_id}/events` — proxy upstream SSE events, fall back to polling if upstream events are unavailable, and emit a final `structured.completed` / `structured.failed` / `structured.skipped` event only when terminal. A run whose structured result is already terminal gets that event immediately, even if upstream has since dropped the run record. If upstream never has a record of the run and no session can be recovered, the poll-fallback gives up after `STRUCTURED_RUNS_SSE_UNKNOWN_TIMEOUT_S` with `structured.failed` (`structured_error: "run_not_found_upstream"`) instead of polling forever.
 - `POST /v1/runs/structured/{run_id}/stop` — pass through to upstream run stop.
 - `POST /v1/runs/structured/{run_id}/approval` — pass through approval responses.
 - The finalizer first launches a **post-completion agent check in the same session**. The agent reviews the client JSON Schema and returns a corrected final answer before JSON extraction.
@@ -138,9 +138,40 @@ If the agent turn cannot start, fails, or exceeds its deadline, the wrapper pres
 
 If the durable delegation state cannot be read (a locked `state.db` or a Hermes-core schema change), the settle step does **not** treat that as "nothing pending": it keeps polling until `STRUCTURED_RUNS_SESSION_SETTLE_TIMEOUT_S` and reports `session_settle.status = "timeout"`. A deployment with no `state.db` at all reports `"unavailable"` and skips the wait. A warning is logged when a query against `state.db` fails.
 
+## Terminal structured state
+
+A completed run always ends at a terminal `structured_status` — `completed`, `failed` or `skipped`. It is never left at `running` with nobody working on it, because a client cannot tell that apart from "result lost":
+
+- Finalization runs as a **background task owned by the plugin event loop**, not by the request that started it. A client that hangs up mid-poll (or a poll that hits `STRUCTURED_RUNS_POLL_FINALIZE_WAIT_S`) cannot cancel it; the work continues and the next poll collects the result.
+- The terminal upstream snapshot is persisted **at claim time**, before the settle / final-check awaits, so the completed output survives Hermes dropping the run record moments later.
+- A finalizer that crashes or exceeds `STRUCTURED_RUNS_FINALIZER_MAX_RUNTIME_S` records `structured_status: "failed"` with a `structured_error` (`structured_finalizer_error: ...` / `structured_finalizer_timeout`).
+- A `running` claim older than `STRUCTURED_RUNS_FINALIZER_STALE_AFTER_S` belongs to a process that died; the next poll reclaims and re-finalizes it. After `STRUCTURED_RUNS_FINALIZER_MAX_ATTEMPTS` the run fails terminally with `structured_finalizer_abandoned_after_N_attempts` rather than looping.
+
 ## Crash recovery
 
-`_finalize_structured` marks a run `structured_status = "running"` before its settle / final-check / finalizer steps. If the gateway restarts during that window, the wrapper rewinds any such run (that has not reached `structured_done`) back to `pending` on load, so the next poll re-runs the finalizer.
+`finalize_structured` marks a run `structured_status = "running"` before its settle / final-check / finalizer steps. If the gateway restarts during that window, the wrapper rewinds any such run (that has not reached `structured_done`) back to `pending` on load, so the next poll re-runs the finalizer — unless it has already used up `STRUCTURED_RUNS_FINALIZER_MAX_ATTEMPTS`, in which case it is failed terminally.
+
+## Retention and lost upstream records
+
+Hermes keeps `/v1/runs` records only briefly, so `GET /v1/runs/{id}` can answer `404 run_not_found` while the structured result is still wanted. A run this wrapper still tracks is therefore never reported as `404`. The poll falls back, in order, to:
+
+1. the terminal upstream snapshot persisted by this wrapper;
+2. a session recovery read from Hermes `state.db`;
+3. the wrapper's own structured record, returned as `status: "unknown"`, `last_event: "upstream_run_record_lost"`, with `upstream_status_unavailable: true` and the upstream error attached.
+
+Only a run this wrapper has *also* forgotten yields `404`, and it does so with a distinct body so the client can tell an expired run from a bad id:
+
+```json
+{
+  "error": {
+    "message": "Run not found upstream and no structured record is retained for run_x. ...",
+    "type": "invalid_request_error",
+    "code": "structured_run_expired",
+    "run_id": "run_x",
+    "structured_retention_s": 604800
+  }
+}
+```
 
 ## Media artifacts
 
@@ -188,6 +219,10 @@ Environment variables:
 | `STRUCTURED_RUNS_SESSION_SETTLE_POLL_INTERVAL_S` | `1` | Seconds between durable delegation-state checks. |
 | `STRUCTURED_RUNS_SSE_UNKNOWN_TIMEOUT_S` | `90` | Grace period before the SSE poll-fallback emits `structured.failed` for a run that upstream has no record of and no recoverable session. |
 | `STRUCTURED_RUNS_STATE_DB_BUSY_TIMEOUT_S` | `5` | SQLite busy timeout when reading Hermes `state.db` (it is written by Hermes core). |
+| `STRUCTURED_RUNS_FINALIZER_MAX_RUNTIME_S` | settle + final-check + `300` | Hard cap on one finalization attempt. On expiry the run ends `failed` with `structured_finalizer_timeout` instead of staying `running`. |
+| `STRUCTURED_RUNS_FINALIZER_STALE_AFTER_S` | `2 ×` max runtime | A `running` claim older than this is treated as abandoned (killed process) and may be reclaimed by the next poll. |
+| `STRUCTURED_RUNS_FINALIZER_MAX_ATTEMPTS` | `3` | Finalization attempts before a run fails terminally with `structured_finalizer_abandoned_after_N_attempts`. |
+| `STRUCTURED_RUNS_POLL_FINALIZE_WAIT_S` | `20` | How long a poll waits on an in-flight finalizer before answering `structured_status: "running"`. Finalization continues in the background either way. |
 | `STRUCTURED_RUNS_RETENTION_S` | `604800` (7 days) | Finished runs older than this are dropped from the registry / state file. `0` disables. |
 | `STRUCTURED_RUNS_MAX_TRACKED` | `2000` | Hard cap on tracked runs; oldest finished runs are dropped first once exceeded. In-flight runs are never dropped. `0` disables. |
 | `STRUCTURED_RUNS_MEDIA_ROOTS` | `/root/motion-graphic-templete,/root/.hermes,/tmp` | Comma-separated roots allowed for media serving. |

@@ -9,6 +9,12 @@ After the upstream run reaches a terminal state the wrapper:
 
 A failed / expired step 2 always falls back to the original completed output --
 it can never erase a valid upstream result.
+
+Finalization runs as a background task owned by the plugin event loop, not by
+the request that triggered it, and every exit path -- success, schema failure,
+crash, hard timeout -- writes a terminal ``structured_status``. A client that
+hangs up mid-poll therefore cannot leave a completed run stranded at
+``structured_status: running`` with no owner.
 """
 from __future__ import annotations
 
@@ -205,23 +211,175 @@ async def _extract_json(
     return {"parsed": parsed, "validation_error": validation_error, "result": result, "exc": None}
 
 
-async def finalize_structured(
-    llm: Any, run_id: str, upstream_status: Dict[str, Any], headers: Dict[str, str]
-) -> Dict[str, Any]:
-    """Idempotent, concurrency-safe finalization for one completed run."""
+# In-flight finalizer tasks, keyed by run_id. The tasks are owned by the plugin
+# event loop rather than by the request that started them, so a client hanging
+# up mid-poll cannot cancel finalization and strand a run at "running".
+_TASKS: Dict[str, "asyncio.Task[Dict[str, Any]]"] = {}
+
+
+def _claim_finalizer(
+    run_id: str, upstream_status: Dict[str, Any]
+) -> Tuple[bool, Dict[str, Any]]:
+    """Decide whether this call owns finalization for ``run_id``.
+
+    Returns ``(claimed, response)``. When ``claimed`` is False the caller has
+    nothing to run and ``response`` is the answer to give. Claiming persists the
+    terminal upstream snapshot immediately -- before any await -- because Hermes
+    can drop the run record at any point after completion, and a snapshot taken
+    later would be lost to ``404 run_not_found``.
+    """
     with _state.LOCK:
         meta = _state.runs.get(run_id)
         if not meta:
-            return upstream_status
+            return False, upstream_status
         if meta.get("structured_done"):
-            return merge_structured(upstream_status, meta)
+            return False, merge_structured(upstream_status, meta)
         if upstream_status.get("status") != "completed":
-            return merge_structured(upstream_status, meta)
+            return False, merge_structured(upstream_status, meta)
+        if meta.get("structured_status") == "running" and not _state.finalizer_is_stale(meta):
+            return False, merge_structured(upstream_status, meta)
+
+        attempts = int(meta.get("structured_attempts") or 0) + 1
+        if attempts > cfg.FINALIZER_MAX_ATTEMPTS:
+            logger.warning(
+                "[structured-runs] Giving up on finalizer for %s after %d attempt(s)",
+                run_id,
+                attempts - 1,
+            )
+            _state.mark_finalizer_failed(
+                meta, f"structured_finalizer_abandoned_after_{attempts - 1}_attempts"
+            )
+            _state.save_state()
+            return False, merge_structured(upstream_status, meta)
+
         if meta.get("structured_status") == "running":
-            return merge_structured(upstream_status, meta)
+            logger.warning(
+                "[structured-runs] Reclaiming stale finalizer claim for %s (attempt %d)",
+                run_id,
+                attempts,
+            )
+        meta["structured_attempts"] = attempts
         meta["structured_status"] = "running"
         meta["structured_started_at"] = _now()
+        meta["upstream_snapshot"] = copy.deepcopy(upstream_status)
         _state.save_state()
+        return True, merge_structured(upstream_status, meta)
+
+
+def _release_finalizer(run_id: str) -> None:
+    """Rewind an unfinished claim to "pending" so a later poll can retry."""
+    with _state.LOCK:
+        meta = _state.runs.get(run_id)
+        if meta and not meta.get("structured_done") and meta.get("structured_status") == "running":
+            meta["structured_status"] = "pending"
+            meta.pop("structured_started_at", None)
+            _state.save_state()
+
+
+def _fail_finalizer(run_id: str, upstream_status: Dict[str, Any], error: str) -> Dict[str, Any]:
+    """Record a terminal structured failure and return the merged view."""
+    with _state.LOCK:
+        meta = _state.runs.get(run_id)
+        if meta and not meta.get("structured_done"):
+            _state.mark_finalizer_failed(meta, error)
+            _state.save_state()
+        return merge_structured(upstream_status, meta)
+
+
+async def _run_finalizer(
+    llm: Any, run_id: str, upstream_status: Dict[str, Any], headers: Dict[str, str]
+) -> Dict[str, Any]:
+    """Own one finalization attempt and always leave a terminal structured state."""
+    try:
+        return await asyncio.wait_for(
+            _finalize_once(llm, run_id, upstream_status, headers),
+            timeout=cfg.FINALIZER_MAX_RUNTIME_S,
+        )
+    except asyncio.TimeoutError:
+        logger.error(
+            "[structured-runs] Finalizer for %s exceeded %.0fs; failing terminally",
+            run_id,
+            cfg.FINALIZER_MAX_RUNTIME_S,
+        )
+        return _fail_finalizer(run_id, upstream_status, "structured_finalizer_timeout")
+    except asyncio.CancelledError:
+        # Event loop shutdown. Rewind so the next poll -- or the next process
+        # start, via _recover_interrupted_finalizers -- retries the run instead
+        # of finding it stuck at "running".
+        _release_finalizer(run_id)
+        raise
+    except Exception as exc:  # noqa: BLE001 - must not leave the run "running"
+        logger.exception("[structured-runs] Finalizer task failed for %s", run_id)
+        return _fail_finalizer(run_id, upstream_status, f"structured_finalizer_error: {exc}")
+
+
+async def _join_finalizer(
+    run_id: str,
+    task: "asyncio.Task[Dict[str, Any]]",
+    fallback: Dict[str, Any],
+    wait_s: Optional[float],
+) -> Dict[str, Any]:
+    """Wait up to ``wait_s`` for the finalizer without ever cancelling it.
+
+    ``asyncio.shield`` keeps the finalizer alive when the caller's request task
+    is cancelled or the wait expires, so the work always reaches a terminal
+    state and the next poll can collect it.
+    """
+    try:
+        if wait_s is None:
+            return await asyncio.shield(task)
+        return await asyncio.wait_for(asyncio.shield(task), timeout=wait_s)
+    except asyncio.CancelledError:
+        raise
+    except asyncio.TimeoutError:
+        logger.info(
+            "[structured-runs] Finalizer for %s still running after %.0fs; answering poll",
+            run_id,
+            wait_s,
+        )
+    except Exception:  # noqa: BLE001 - the task records its own failure
+        logger.exception("[structured-runs] Finalizer task for %s raised", run_id)
+    with _state.LOCK:
+        return merge_structured(fallback, _state.runs.get(run_id))
+
+
+async def finalize_structured(
+    llm: Any,
+    run_id: str,
+    upstream_status: Dict[str, Any],
+    headers: Dict[str, str],
+    *,
+    wait_s: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Idempotent, concurrency-safe finalization for one completed run.
+
+    Finalization runs as a background task; ``wait_s`` bounds only how long the
+    caller blocks on it (``None`` waits for the terminal state). Whatever
+    happens to the caller, the run ends at ``completed``, ``failed`` or
+    ``skipped`` -- never at ``running`` with nobody working on it.
+    """
+    claimed, response = _claim_finalizer(run_id, upstream_status)
+    if claimed:
+        task = asyncio.get_running_loop().create_task(
+            _run_finalizer(llm, run_id, upstream_status, headers)
+        )
+        _TASKS[run_id] = task
+        task.add_done_callback(lambda _t, rid=run_id: _TASKS.pop(rid, None))
+    else:
+        task = _TASKS.get(run_id)
+        if task is None or task.done():
+            return response
+    return await _join_finalizer(run_id, task, response, wait_s)
+
+
+async def _finalize_once(
+    llm: Any, run_id: str, upstream_status: Dict[str, Any], headers: Dict[str, str]
+) -> Dict[str, Any]:
+    """The finalization work itself, for a run already claimed by the caller."""
+    with _state.LOCK:
+        meta = copy.deepcopy(_state.runs.get(run_id))
+    if not meta:
+        return upstream_status
 
     # A terminal /v1/runs state can precede delivery of background delegation
     # results. Wait for durable delegation delivery, then read the latest

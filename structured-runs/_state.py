@@ -36,6 +36,40 @@ def load_state() -> None:
     _recover_interrupted_finalizers()
 
 
+def mark_finalizer_failed(meta: Dict[str, Any], error: str) -> None:
+    """Put a run into a terminal failed structured state. Caller must hold ``LOCK``.
+
+    A structured run must never be left at "running" with no owner: clients
+    cannot tell that apart from "result lost". Every abandoned finalizer ends
+    here instead, with ``structured_error`` explaining why.
+    """
+    meta["structured_status"] = "failed"
+    meta["structured_done"] = True
+    meta["structured_error"] = error
+    meta["structured_finished_at"] = _now()
+    meta.setdefault("parsed", None)
+    meta.pop("structured_started_at", None)
+
+
+def finalizer_is_stale(meta: Dict[str, Any]) -> bool:
+    """True when a "running" claim has outlived any finalizer that could own it.
+
+    An in-process finalizer is hard-capped at ``FINALIZER_MAX_RUNTIME_S`` and
+    always writes a terminal state, so a claim older than
+    ``FINALIZER_STALE_AFTER_S`` means its owner died (killed process) and the
+    run may be re-finalized.
+    """
+    if meta.get("structured_done") or meta.get("structured_status") != "running":
+        return False
+    started = meta.get("structured_started_at")
+    if not started:
+        return True
+    try:
+        return _now() - float(started) > cfg.FINALIZER_STALE_AFTER_S
+    except (TypeError, ValueError):
+        return True
+
+
 def _recover_interrupted_finalizers() -> None:
     """Rewind finalizers that were mid-flight when the process last stopped.
 
@@ -44,15 +78,28 @@ def _recover_interrupted_finalizers() -> None:
     "running" as "another task already owns this run". If the gateway restarts
     inside that window the run would stay "running" forever and never re-finalize.
     On load, any run that is "running" without ``structured_done`` is orphaned:
-    reset it to "pending" so the next poll re-runs the (idempotent) finalizer.
+    reset it to "pending" so the next poll re-runs the (idempotent) finalizer --
+    unless it has already burned its attempts, in which case it is failed
+    terminally rather than left to loop.
     """
     changed = False
-    for meta in runs.values():
+    for run_id, meta in runs.items():
         if not isinstance(meta, dict):
             continue
         if meta.get("structured_status") == "running" and not meta.get("structured_done"):
-            meta["structured_status"] = "pending"
-            meta.pop("structured_started_at", None)
+            attempts = int(meta.get("structured_attempts") or 0)
+            if attempts >= cfg.FINALIZER_MAX_ATTEMPTS:
+                logger.warning(
+                    "[structured-runs] Giving up on finalizer for %s after %d attempt(s)",
+                    run_id,
+                    attempts,
+                )
+                mark_finalizer_failed(
+                    meta, f"structured_finalizer_abandoned_after_{attempts}_attempts"
+                )
+            else:
+                meta["structured_status"] = "pending"
+                meta.pop("structured_started_at", None)
             changed = True
     if changed:
         logger.info("[structured-runs] Reset orphaned in-progress finalizer(s) on load")
