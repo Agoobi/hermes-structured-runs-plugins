@@ -184,12 +184,25 @@ _FINALIZER_INSTRUCTIONS = (
 
 
 async def _extract_json(
-    llm: Any, run_id: str, output_text: str, schema: Dict[str, Any], schema_name: str
+    llm: Any,
+    run_id: str,
+    output_text: str,
+    schema: Dict[str, Any],
+    schema_name: str,
+    verbatim_source: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run the finalizer LLM once on ``output_text``.
 
     Pure: canonicalizes / enriches / validates but does not touch the registry.
     Returns ``{parsed, validation_error, result, exc}`` (any of which may be None).
+
+    ``verbatim_source`` -- when the schema marks one property
+    ``x-verbatim-from-output: true``, that property is overwritten with
+    ``verbatim_source`` after parsing, regardless of what the LLM returned for
+    it. Callers pass whichever text this extraction attempt is actually
+    finalizing (``original_output`` on the first pass, the post-completion
+    re-check's corrected output on the escalation pass) so the substituted
+    value always matches what the finalizer was asked to convert.
     """
     try:
         result = await asyncio.to_thread(
@@ -207,6 +220,10 @@ async def _extract_json(
 
     parsed = media.canonicalize_artifact_paths(result.parsed)
     parsed = media.enrich_media_urls(run_id, parsed)
+    if verbatim_source is not None and isinstance(parsed, dict):
+        field = schema_mod.verbatim_field_name(schema)
+        if field:
+            parsed[field] = verbatim_source[: cfg.MAX_OUTPUT_CHARS]
     validation_error = schema_mod.validate_parsed(parsed, schema)
     return {"parsed": parsed, "validation_error": validation_error, "result": result, "exc": None}
 
@@ -424,7 +441,8 @@ async def _finalize_once(
     # the "BƯỚC KIỂM TRA OUTPUT CUỐI" re-check.
     if mode != "always":
         extract = await _extract_json(
-            llm, run_id, _clip(original_output + artifact_suffix), schema, schema_name
+            llm, run_id, _clip(original_output + artifact_suffix), schema, schema_name,
+            verbatim_source=original_output,
         )
         first_pass_ok = (
             extract["exc"] is None
@@ -449,7 +467,8 @@ async def _finalize_once(
             run_id, upstream_status, schema, headers, verified_artifacts
         )
         extract = await _extract_json(
-            llm, run_id, _clip(checked_output + artifact_suffix), schema, schema_name
+            llm, run_id, _clip(checked_output + artifact_suffix), schema, schema_name,
+            verbatim_source=checked_output,
         )
 
     with _state.LOCK:

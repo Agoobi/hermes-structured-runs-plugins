@@ -18,6 +18,29 @@ def validation_available() -> bool:
     return jsonschema is not None
 
 
+def verbatim_field_name(schema: Dict[str, Any]) -> Optional[str]:
+    """Return the one top-level property marked ``x-verbatim-from-output``, if any.
+
+    ``x-verbatim-from-output: true`` on a top-level string property tells the
+    finalizer to skip asking the LLM to reproduce that field and substitute
+    the run's raw ``output`` directly instead (see _finalize.py). At most one
+    property may carry the marker -- there is only one ``output`` blob to
+    substitute, so a second marked field would silently receive the exact
+    same text, which is never what a schema author actually wants. Callers
+    that need more than one large verbatim block should split the work into
+    separate structured runs instead.
+    """
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        return None
+    marked = [
+        name
+        for name, prop in properties.items()
+        if isinstance(prop, dict) and prop.get("x-verbatim-from-output") is True
+    ]
+    return marked[0] if len(marked) == 1 else None
+
+
 def schema_error(schema: Any) -> Optional[str]:
     """Return why ``schema`` is unusable as a final-output contract, or None."""
     if not isinstance(schema, dict):
@@ -30,6 +53,23 @@ def schema_error(schema: Any) -> Optional[str]:
             jsonschema.Draft202012Validator.check_schema(schema)
         except Exception as exc:
             return f"Invalid JSON Schema: {exc}"
+    properties = schema.get("properties")
+    if isinstance(properties, dict):
+        marked = [
+            name
+            for name, prop in properties.items()
+            if isinstance(prop, dict) and prop.get("x-verbatim-from-output") is True
+        ]
+        if len(marked) > 1:
+            return (
+                "at most one property may set x-verbatim-from-output: true "
+                f"(got {sorted(marked)}); split into separate structured runs "
+                "instead of marking more than one field"
+            )
+        for name in marked:
+            prop_type = properties[name].get("type")
+            if prop_type != "string":
+                return f"x-verbatim-from-output on '{name}' requires type: 'string' (got {prop_type!r})"
     return None
 
 
