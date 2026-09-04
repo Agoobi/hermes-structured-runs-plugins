@@ -29,8 +29,20 @@ relative imports.
 - `GET /v1/runs/structured/{run_id}/events` — proxy upstream SSE events, fall back to polling if upstream events are unavailable, and emit a final `structured.completed` / `structured.failed` / `structured.skipped` event only when terminal. If upstream never has a record of the run and no session can be recovered, the poll-fallback gives up after `STRUCTURED_RUNS_SSE_UNKNOWN_TIMEOUT_S` with `structured.failed` (`structured_error: "run_not_found_upstream"`) instead of polling forever.
 - `POST /v1/runs/structured/{run_id}/stop` — pass through to upstream run stop.
 - `POST /v1/runs/structured/{run_id}/approval` — pass through approval responses.
-- The finalizer first launches a **post-completion agent check in the same session**. The agent reviews the client JSON Schema and returns a corrected final answer before JSON extraction.
+- The finalizer first launches a **post-completion agent check in the same session** (by default only when finalizing the agent's own output is not schema-valid — see `STRUCTURED_RUNS_FINAL_CHECK_MODE`).
 - `GET /v1/runs/structured/{run_id}/media?path=...` — serve attached image/video/audio artifacts safely.
+
+## API reference (OpenAPI + Swagger UI)
+
+`docs/openapi.json` is a hand-maintained OpenAPI 3.1 spec covering the plugin's routes (`:8646`) plus the Hermes core routes it wraps / you call directly (`:8642`).
+
+```bash
+bun run swagger          # validate the spec, then serve Swagger UI on http://localhost:8677
+bun run swagger -- 9000  # pick a port
+bun run swagger:lint     # validate only (no server) — usable in CI
+```
+
+`preswagger` runs `bun install` first; Swagger UI assets are served from the `swagger-ui-dist` package (works offline after the first install).
 
 ## Install
 

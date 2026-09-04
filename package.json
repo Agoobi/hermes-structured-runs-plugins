@@ -1,0 +1,14 @@
+{
+  "name": "hermes-structured-runs-docs",
+  "version": "1.3.0",
+  "private": true,
+  "description": "OpenAPI spec + Swagger UI viewer for the structured-runs plugin (and the Hermes core endpoints it wraps)",
+  "scripts": {
+    "preswagger": "bun install --silent",
+    "swagger": "bun run docs/swagger/serve.ts",
+    "swagger:lint": "bun run docs/swagger/serve.ts --lint"
+  },
+  "devDependencies": {
+    "swagger-ui-dist": "^5.17.14"
+  }
+}

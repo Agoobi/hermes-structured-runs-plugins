@@ -4,3 +4,6 @@ __pycache__/
 *.log
 .DS_Store
 structured_runs_state.json
+
+# docs/swagger tooling
+node_modules/

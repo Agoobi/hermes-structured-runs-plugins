@@ -120,6 +120,9 @@ flowchart TD
 
 ## 3. Các endpoint
 
+Spec đầy đủ (request/response schema, ví dụ, cả endpoint hermes-core liên quan):
+`docs/openapi.json` — xem bằng `bun run swagger`.
+
 Tất cả nằm trên `:8646`, forward tới `:8642` (`STRUCTURED_RUNS_UPSTREAM`).
 
 | Method | Path | Ý nghĩa |
