@@ -74,6 +74,63 @@ def build_app(ctx) -> web.Application:
         out.update({"structured": True, "structured_status": "pending", "structured_schema_name": schema_name})
         return web.json_response(out, status=status)
 
+    async def serve_without_upstream(
+        run_id: str, meta: Optional[Dict[str, Any]], upstream_error: Any, headers: Dict[str, str]
+    ):
+        """Answer a poll when upstream no longer has the run record.
+
+        Falls back in order: the terminal snapshot this wrapper persisted, a
+        session-db recovery, then the wrapper's own structured record. A run the
+        wrapper still tracks is never reported as 404 -- a client must be able to
+        collect its terminal structured result even after upstream retention has
+        expired. Only a run this wrapper has also forgotten yields 404, with a
+        distinct ``structured_run_expired`` code so the client can tell
+        "retention elapsed" apart from "bad run id".
+        """
+        snapshot = None
+        if meta and meta.get("upstream_snapshot"):
+            snapshot = copy.deepcopy(meta["upstream_snapshot"])
+        else:
+            snapshot = session_db.session_recovery_snapshot(run_id)
+
+        if snapshot is not None:
+            snapshot["upstream_status_unavailable"] = True
+            snapshot["upstream_error"] = upstream_error
+            if snapshot.get("status") == "completed" and meta and not meta.get("structured_done"):
+                merged = await finalize.finalize_structured(
+                    ctx.llm, run_id, snapshot, headers, wait_s=cfg.POLL_FINALIZE_WAIT_S
+                )
+                return web.json_response(merged, status=200)
+            return web.json_response(finalize.merge_structured(snapshot, meta), status=200)
+
+        if meta:
+            lost = {
+                "object": "hermes.run",
+                "run_id": run_id,
+                "status": "unknown",
+                "last_event": "upstream_run_record_lost",
+                "upstream_status_unavailable": True,
+                "upstream_error": upstream_error,
+            }
+            return web.json_response(finalize.merge_structured(lost, meta), status=200)
+
+        return web.json_response(
+            {
+                "error": {
+                    "message": (
+                        f"Run not found upstream and no structured record is retained for {run_id}. "
+                        f"Structured runs are kept for {cfg.RUN_RETENTION_S:.0f}s after finalization."
+                    ),
+                    "type": "invalid_request_error",
+                    "code": "structured_run_expired",
+                    "run_id": run_id,
+                    "structured_retention_s": cfg.RUN_RETENTION_S,
+                    "upstream_error": upstream_error,
+                }
+            },
+            status=404,
+        )
+
     async def poll_structured_run(request: web.Request):
         run_id = request.match_info["run_id"]
         headers = upstream.headers_from_request(request)
@@ -87,21 +144,7 @@ def build_app(ctx) -> web.Application:
             # cases after the caller has supplied a valid API key.
             if status in {401, 403}:
                 return web.json_response(upstream_status, status=status)
-            if meta and meta.get("upstream_snapshot"):
-                cached = copy.deepcopy(meta["upstream_snapshot"])
-                cached["upstream_status_unavailable"] = True
-                cached["upstream_error"] = upstream_status
-                if cached.get("status") == "completed" and not meta.get("structured_done"):
-                    merged = await finalize.finalize_structured(ctx.llm, run_id, cached, headers)
-                    return web.json_response(merged, status=200)
-                return web.json_response(finalize.merge_structured(cached, meta), status=200)
-            recovered = session_db.session_recovery_snapshot(run_id)
-            if recovered:
-                if recovered.get("status") == "completed" and meta:
-                    merged = await finalize.finalize_structured(ctx.llm, run_id, recovered, headers)
-                    return web.json_response(merged, status=200)
-                return web.json_response(finalize.merge_structured(recovered, meta), status=200)
-            return web.json_response(upstream_status, status=status)
+            return await serve_without_upstream(run_id, meta, upstream_status, headers)
 
         if not meta:
             # Unknown to wrapper: behave like upstream but mark no schema mapping.
@@ -111,16 +154,23 @@ def build_app(ctx) -> web.Application:
             return web.json_response(upstream_status, status=status)
 
         if upstream_status.get("status") == "completed":
-            merged = await finalize.finalize_structured(ctx.llm, run_id, upstream_status, headers)
+            merged = await finalize.finalize_structured(
+                ctx.llm, run_id, upstream_status, headers, wait_s=cfg.POLL_FINALIZE_WAIT_S
+            )
             return web.json_response(merged, status=status)
 
         if upstream_status.get("status") in {"failed", "cancelled"}:
             with _state.LOCK:
                 meta = _state.runs.get(run_id)
-                if meta and not meta.get("structured_done"):
-                    meta["structured_done"] = True
-                    meta["structured_status"] = "skipped"
-                    meta["structured_error"] = f"upstream_{upstream_status.get('status')}"
+                if meta:
+                    # Keep the terminal upstream view so this run stays
+                    # answerable once upstream drops its record.
+                    meta["upstream_snapshot"] = copy.deepcopy(upstream_status)
+                    if not meta.get("structured_done"):
+                        meta["structured_done"] = True
+                        meta["structured_status"] = "skipped"
+                        meta["structured_error"] = f"upstream_{upstream_status.get('status')}"
+                        meta["structured_finished_at"] = _now()
                     _state.save_state()
 
         with _state.LOCK:
@@ -170,6 +220,29 @@ def build_app(ctx) -> web.Application:
 
         return web.FileResponse(path=resolved)
 
+    async def write_terminal_structured_event(response: web.StreamResponse, run_id: str, merged: Dict[str, Any]):
+        """Emit the one terminal structured event for a run."""
+        sstatus = merged.get("structured_status")
+        if sstatus == "completed":
+            event_name = "structured.completed"
+        elif sstatus == "skipped":
+            event_name = "structured.skipped"
+        else:
+            event_name = "structured.failed"
+        payload = {
+            "run_id": run_id,
+            "upstream_status": merged.get("status"),
+            "structured_status": sstatus,
+            "parsed": merged.get("parsed"),
+            "content_type": merged.get("content_type"),
+            "structured_model": merged.get("structured_model"),
+            "structured_usage": merged.get("structured_usage"),
+            "structured_error": merged.get("structured_error"),
+        }
+        await response.write(
+            f"event: {event_name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
+        )
+
     async def stream_structured_events(request: web.Request):
         run_id = request.match_info["run_id"]
         headers = upstream.headers_from_request(request)
@@ -185,6 +258,23 @@ def build_app(ctx) -> web.Application:
             },
         )
         await response.prepare(request)
+
+        # A structured result that is already terminal is delivered straight
+        # away: upstream may have dropped the run record long ago, and a client
+        # reconnecting to /events must still receive its terminal event rather
+        # than a run_not_found.
+        with _state.LOCK:
+            done_meta = copy.deepcopy(_state.runs.get(run_id))
+        if done_meta and done_meta.get("structured_done"):
+            snapshot = done_meta.get("upstream_snapshot") or {
+                "run_id": run_id,
+                "status": "unknown",
+                "last_event": "upstream_run_record_lost",
+            }
+            await write_terminal_structured_event(
+                response, run_id, finalize.merge_structured(snapshot, done_meta)
+            )
+            return response
 
         upstream_events_ok = False
         try:
@@ -268,38 +358,26 @@ def build_app(ctx) -> web.Application:
                     continue
 
                 if run_state == "completed":
-                    merged = await finalize.finalize_structured(ctx.llm, run_id, upstream_status, headers)
+                    # wait_s=None: the stream has no client read timeout to
+                    # respect, and the finalizer is itself hard-capped, so this
+                    # always resolves to a terminal structured state.
+                    merged = await finalize.finalize_structured(
+                        ctx.llm, run_id, upstream_status, headers, wait_s=None
+                    )
                 else:
                     with _state.LOCK:
                         meta = _state.runs.get(run_id)
-                        if meta and not meta.get("structured_done"):
-                            meta["structured_done"] = True
-                            meta["structured_status"] = "skipped"
-                            meta["structured_error"] = f"upstream_{run_state}"
+                        if meta:
                             meta["upstream_snapshot"] = copy.deepcopy(upstream_status)
+                            if not meta.get("structured_done"):
+                                meta["structured_done"] = True
+                                meta["structured_status"] = "skipped"
+                                meta["structured_error"] = f"upstream_{run_state}"
+                                meta["structured_finished_at"] = _now()
                             _state.save_state()
                         merged = finalize.merge_structured(upstream_status, meta)
 
-                sstatus = merged.get("structured_status")
-                if sstatus == "completed":
-                    event_name = "structured.completed"
-                elif sstatus == "skipped":
-                    event_name = "structured.skipped"
-                else:
-                    event_name = "structured.failed"
-                payload = {
-                    "run_id": run_id,
-                    "upstream_status": merged.get("status"),
-                    "structured_status": sstatus,
-                    "parsed": merged.get("parsed"),
-                    "content_type": merged.get("content_type"),
-                    "structured_model": merged.get("structured_model"),
-                    "structured_usage": merged.get("structured_usage"),
-                    "structured_error": merged.get("structured_error"),
-                }
-                await response.write(
-                    f"event: {event_name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
-                )
+                await write_terminal_structured_event(response, run_id, merged)
                 return response
         except (ConnectionResetError, asyncio.CancelledError):
             return response
@@ -343,6 +421,7 @@ def build_app(ctx) -> web.Application:
             running_finalizers = sum(
                 1 for r in _state.runs.values() if r.get("structured_status") == "running"
             )
+            stale_finalizers = sum(1 for r in _state.runs.values() if _state.finalizer_is_stale(r))
         return web.json_response(
             {
                 "status": "ok",
@@ -350,6 +429,7 @@ def build_app(ctx) -> web.Application:
                 "upstream": cfg.API_BASE,
                 "tracked_runs": tracked,
                 "running_finalizers": running_finalizers,
+                "stale_finalizers": stale_finalizers,
                 "state_file": str(cfg.STATE_FILE),
                 "jsonschema_validation": schema_mod.validation_available(),
             }

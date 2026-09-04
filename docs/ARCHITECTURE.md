@@ -108,12 +108,12 @@ flowchart TD
 |---|---|---|
 | `__init__.py` | `register(ctx)`: load state → build app → start thread `:8646` | `register` |
 | `_config.py` | Một nguồn sự thật cho mọi env var / path / regex / allowlist | `API_BASE`, `STATE_FILE`, `STATE_DB`, `MEDIA_ROOTS`, `TERMINAL_STATES`, `HEADER_ALLOWLIST`, `_now` |
-| `_state.py` | Registry `runs` in-memory + persist JSON; crash recovery; eviction | `runs`, `LOCK`, `load_state`, `save_state`, `evict_runs_locked`, `_recover_interrupted_finalizers` |
+| `_state.py` | Registry `runs` in-memory + persist JSON; crash recovery; eviction | `runs`, `LOCK`, `load_state`, `save_state`, `evict_runs_locked`, `_recover_interrupted_finalizers`, `mark_finalizer_failed`, `finalizer_is_stale` |
 | `_session_db.py` | Đọc Hermes `state.db` (read-only); chờ delegation settle | `session_recovery_snapshot`, `session_work_state`, `latest_session_output`, `wait_for_session_settle` |
 | `_schema.py` | Validate `json_schema` và `parsed` bằng `jsonschema` (optional dep) | `schema_error`, `validate_parsed`, `validation_available` |
 | `_media.py` | Resolve path artifact chống traversal; enrich `*_url` | `resolve_media_path`, `verified_artifacts_from_text`, `canonicalize_artifact_paths`, `enrich_media_urls` |
 | `_upstream.py` | HTTP client tới `:8642`; lọc header theo allowlist | `headers_from_request`, `json_request` |
-| `_finalize.py` | Post-completion agent check + `complete_structured` finalizer | `finalize_structured`, `post_completion_final_check`, `merge_structured`, `final_output_check_prompt`, `run_output_text` |
+| `_finalize.py` | Post-completion agent check + `complete_structured` finalizer; background task luôn kết thúc terminal | `finalize_structured`, `_claim_finalizer`, `_run_finalizer`, `_finalize_once`, `post_completion_final_check`, `merge_structured`, `final_output_check_prompt`, `run_output_text` |
 | `_app.py` | Toàn bộ route handler + `build_app(ctx)` | `build_app` |
 
 ---
@@ -210,13 +210,14 @@ flowchart TD
     META --> ERRCHK{"upstream status >= 400 ?"}
 
     ERRCHK -- "401 / 403" --> AUTH["trả nguyên body + status — KHÔNG serve cache (security)"]
-    ERRCHK -- "khác 4xx / 5xx" --> SNAP{"có meta.upstream_snapshot ?"}
+    ERRCHK -- "khác 4xx / 5xx" --> SNAP{"serve_without_upstream — có meta.upstream_snapshot ?"}
     SNAP -- "có — snapshot completed và chưa structured_done" --> FIN1["finalize_structured(cached) → 200"]
     SNAP -- "có — còn lại" --> MERGE1["merge_structured(snapshot, meta) → 200"]
     SNAP -- "không" --> REC{"session_recovery_snapshot(run_id) — đọc state.db"}
     REC -- "recovered completed và có meta" --> FIN2["finalize_structured(recovered) → 200"]
     REC -- "recovered khác" --> MERGE2["merge_structured(recovered, meta) → 200"]
-    REC -- "không recover được" --> RAW["trả upstream nguyên + status gốc"]
+    REC -- "không recover được nhưng CÓ meta" --> LOST["status unknown + last_event upstream_run_record_lost + merge_structured(meta) → 200"]
+    REC -- "không recover được và KHÔNG có meta" --> EXPIRED["404 code structured_run_expired + structured_retention_s"]
 
     ERRCHK -- "OK (< 400)" --> HASMETA{"có meta ?"}
     HASMETA -- "không" --> NOMAP["trả upstream + structured false + structured_error schema_mapping_not_found"]
@@ -231,6 +232,12 @@ flowchart TD
 serve `parsed` đã cache. Cache fallback chỉ dành cho trường hợp retention/`404`
 *sau khi* caller đã cung cấp API key hợp lệ.
 
+**Run đang được wrapper theo dõi không bao giờ bị trả `404`.** Registry `/v1/runs`
+của Hermes biến mất rất sớm sau khi run xong; nếu wrapper cũng trả `404` thì client
+mất luôn kết quả structured đã hoàn thành. Chỉ run mà **wrapper cũng đã quên** mới
+trả `404`, và trả kèm `code: "structured_run_expired"` + `structured_retention_s`
+để client phân biệt "hết retention" với "sai run id".
+
 **`session_recovery_snapshot(run_id)`** (trong `_session_db.py`) dựng lại một
 object giống `/v1/runs` từ `state.db`:
 
@@ -244,9 +251,22 @@ object giống `/v1/runs` từ `state.db`:
 
 ## 6. Luồng 3 — Finalizer (`finalize_structured`) — TRỌNG TÂM
 
-Hàm `_finalize.finalize_structured(llm, run_id, upstream_status, headers)` được
-gọi từ cả poll và SSE khi upstream `completed`. Nó **idempotent** và **an toàn
+Hàm `_finalize.finalize_structured(llm, run_id, upstream_status, headers, *, wait_s)`
+được gọi từ cả poll và SSE khi upstream `completed`. Nó **idempotent** và **an toàn
 concurrency**.
+
+Công việc finalize chạy trong **background task thuộc event loop của plugin**
+(`_finalize._TASKS`), không thuộc request đã khởi động nó. `wait_s` chỉ giới hạn
+thời gian *caller chờ* (poll: `POLL_FINALIZE_WAIT_S`; SSE: `None` = chờ tới cùng),
+và `asyncio.shield` bảo đảm hết thời gian chờ — hoặc client ngắt kết nối giữa
+chừng — **không** hủy được task. Đây chính là lỗi cũ: client Rails timeout →
+handler bị cancel → run kẹt vĩnh viễn ở `structured_status: "running"`.
+
+**Bất biến:** một run `completed` luôn kết thúc ở trạng thái terminal
+(`completed` / `failed` / `skipped`), không bao giờ ở `running` mà không có ai xử lý.
+Mọi nhánh thoát của `_run_finalizer` đều ghi trạng thái terminal: exception →
+`structured_finalizer_error: ...`; quá `FINALIZER_MAX_RUNTIME_S` →
+`structured_finalizer_timeout`; loop shutdown → rewind về `pending` cho lần poll sau.
 
 ### 6.1. Sequence đầy đủ
 
@@ -267,10 +287,12 @@ sequenceDiagram
     CALLER->>F: (llm, run_id, upstream_status, headers)
 
     rect rgb(235,238,252)
-    note over F,ST: BƯỚC 1 — guards (giữ LOCK, không await)
+    note over F,ST: BƯỚC 1 — _claim_finalizer (giữ LOCK, không await)
     F->>ST: meta = runs.get(run_id)
-    Note over F,ST: return sớm nếu meta None, hoặc structured_done, hoặc status != completed, hoặc status == running
-    F->>ST: meta.structured_status = "running", structured_started_at = now
+    Note over F,ST: không claim nếu meta None / structured_done / status != completed / đang "running" và CHƯA stale
+    Note over F,ST: "running" đã quá FINALIZER_STALE_AFTER_S = chủ cũ đã chết → reclaim; quá FINALIZER_MAX_ATTEMPTS → failed terminal
+    F->>ST: structured_attempts += 1, structured_status = "running", structured_started_at = now
+    F->>ST: upstream_snapshot = upstream_status (persist NGAY, trước mọi await)
     ST->>ST: save_state()
     end
 
@@ -351,7 +373,7 @@ sequenceDiagram
     end
 
     F->>ST: return merge_structured(upstream_status, runs.get(run_id))
-    F-->>CALLER: merged response
+    F-->>CALLER: merged response (hoặc "running" nếu caller đã hết wait_s — task vẫn chạy tiếp)
 ```
 
 > `STRUCTURED_RUNS_FINAL_CHECK_MODE`: `auto` (mặc định, sơ đồ trên) — `always`
@@ -363,7 +385,7 @@ sequenceDiagram
 
 | Bước | Vấn đề nó giải quyết |
 |---|---|
-| **1. Guards + `running`** | Hai poll đồng thời (hoặc poll + SSE) không được finalize 2 lần. `structured_done` = đã xong; `structured_status == "running"` = có task khác đang chạy. |
+| **1. `_claim_finalizer` + `running`** | Hai poll đồng thời (hoặc poll + SSE) không được finalize 2 lần. `structured_done` = đã xong; `structured_status == "running"` = có task khác đang chạy. Claim persist `upstream_snapshot` **ngay lập tức** vì Hermes có thể xóa run record chỉ vài giây sau khi completed — snapshot chụp muộn hơn sẽ mất trắng output vào `404 run_not_found`. Claim `running` quá cũ (`FINALIZER_STALE_AFTER_S`) là của process đã chết nên được reclaim, nhưng chỉ tối đa `FINALIZER_MAX_ATTEMPTS` lần rồi fail hẳn. |
 | **2. `wait_for_session_settle`** | `/v1/runs` có thể báo `completed` trong khi `delegate_task` chạy nền vẫn đang deliver kết quả vào cùng session. Finalize ngay = chụp reply cũ. Chờ tới khi `async_delegations` của session này delivered hết + có khoảng lặng (`SESSION_QUIET_S`). **Nếu không đọc được `state.db` thì KHÔNG coi là settled** — chờ tới timeout (tránh finalize trên reply cũ khi DB chỉ lock tạm). |
 | **3. `latest_session_output`** | Sau settle, lấy reply `assistant` mới nhất thật sự (bỏ tool-call placeholder), thay cho `output` terminal đầu tiên. |
 | **4. persist snapshot** | Hermes giữ run status rất ngắn. Sau restart / hết retention, `/v1/runs/:id` trả `404` trong khi wrapper vẫn còn schema + kết quả. Lưu terminal snapshot để poll vẫn deterministic. |

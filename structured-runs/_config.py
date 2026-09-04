@@ -35,6 +35,25 @@ STATE_DB_BUSY_TIMEOUT_S = float(os.getenv("STRUCTURED_RUNS_STATE_DB_BUSY_TIMEOUT
 RUN_RETENTION_S = float(os.getenv("STRUCTURED_RUNS_RETENTION_S", str(7 * 24 * 3600)))
 MAX_TRACKED_RUNS = int(os.getenv("STRUCTURED_RUNS_MAX_TRACKED", "2000"))
 
+# Hard cap on a single finalization attempt. The finalizer must always leave a
+# terminal structured state, so this also covers the two LLM calls, which have
+# no timeout of their own, on top of the bounded settle / final-check waits.
+FINALIZER_MAX_RUNTIME_S = float(
+    os.getenv("STRUCTURED_RUNS_FINALIZER_MAX_RUNTIME_S")
+    or (SESSION_SETTLE_TIMEOUT_S + FINAL_CHECK_TIMEOUT_S + 300.0)
+)
+# A "running" claim older than this belongs to a finalizer that died without
+# unwinding (killed process), so the next poll may reclaim it.
+FINALIZER_STALE_AFTER_S = float(
+    os.getenv("STRUCTURED_RUNS_FINALIZER_STALE_AFTER_S") or (FINALIZER_MAX_RUNTIME_S * 2)
+)
+# Fail the run instead of re-claiming a finalizer that keeps dying.
+FINALIZER_MAX_ATTEMPTS = int(os.getenv("STRUCTURED_RUNS_FINALIZER_MAX_ATTEMPTS", "3"))
+# How long GET /v1/runs/structured/{id} blocks on an in-flight finalizer before
+# answering "structured_status: running". Finalization continues either way, so
+# this only bounds the poll, never the work.
+POLL_FINALIZE_WAIT_S = float(os.getenv("STRUCTURED_RUNS_POLL_FINALIZE_WAIT_S", "20"))
+
 MEDIA_PATH_RE = re.compile(
     r"(?:MEDIA:)?(?:(?:/|~?/)?(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+\.(?:mp4|mov|mkv|webm|mp3|wav|m4a|ogg|png|jpe?g|webp|gif|pdf|docx|xlsx|csv|zip))",
     re.IGNORECASE,

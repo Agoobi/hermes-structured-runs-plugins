@@ -43,6 +43,29 @@ class RecoverInterruptedFinalizersTests(unittest.TestCase):
         _state._recover_interrupted_finalizers()
         self.assertFalse(self.saved)
 
+    def test_run_past_the_attempt_cap_fails_instead_of_rewinding(self) -> None:
+        orig_attempts = _config.FINALIZER_MAX_ATTEMPTS
+        _config.FINALIZER_MAX_ATTEMPTS = 2
+        logging.disable(logging.CRITICAL)  # expected give-up warning
+        self.addCleanup(logging.disable, logging.NOTSET)
+        _state.runs = {
+            "run_e": {
+                "structured_status": "running",
+                "structured_done": False,
+                "structured_attempts": 2,
+            }
+        }
+        try:
+            _state._recover_interrupted_finalizers()
+        finally:
+            _config.FINALIZER_MAX_ATTEMPTS = orig_attempts
+
+        meta = _state.runs["run_e"]
+        self.assertEqual(meta["structured_status"], "failed")
+        self.assertTrue(meta["structured_done"])
+        self.assertEqual(meta["structured_error"], "structured_finalizer_abandoned_after_2_attempts")
+        self.assertIsNone(meta["parsed"])
+
 
 class SessionWorkStateReasonTests(unittest.TestCase):
     def test_missing_db_reports_no_state_db(self) -> None:
