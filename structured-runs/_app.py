@@ -12,9 +12,10 @@ import json
 import logging
 from typing import Any, Dict, Optional
 
-from aiohttp import ClientSession, ClientTimeout, web
+from aiohttp import web
 
 from . import _config as cfg
+from . import _events as events
 from . import _finalize as finalize
 from . import _media as media
 from . import _schema as schema_mod
@@ -69,6 +70,14 @@ def build_app(ctx) -> web.Application:
                 "structured_status": "pending",
             }
             _state.save_state()
+
+        # Start buffering upstream SSE events from t0 so a client that connects
+        # (or reconnects) to /events later still gets the full log; the drainer
+        # also runs the finalizer on terminal.
+        try:
+            events.ensure_log(run_id, headers, ctx.llm)
+        except Exception:
+            logger.exception("[structured-runs] could not start event drainer for %s", run_id)
 
         out = dict(data)
         out.update({"structured": True, "structured_status": "pending", "structured_schema_name": schema_name})
@@ -170,10 +179,29 @@ def build_app(ctx) -> web.Application:
 
         return web.FileResponse(path=resolved)
 
+    def _sse_frame(evt: Dict[str, Any]) -> bytes:
+        if evt.get("name") == "keepalive":
+            return b": keepalive\n\n"
+        lines = []
+        if evt.get("seq") is not None:
+            lines.append(f"id: {evt['seq']}")
+        lines.append(f"event: {evt.get('name', 'message')}")
+        lines.append(f"data: {json.dumps(evt.get('data', {}), ensure_ascii=False)}")
+        return ("\n".join(lines) + "\n\n").encode("utf-8")
+
     async def stream_structured_events(request: web.Request):
         run_id = request.match_info["run_id"]
         headers = upstream.headers_from_request(request)
         headers.pop("Content-Type", None)
+
+        after = 0
+        for raw in (request.headers.get("Last-Event-ID"), request.query.get("after")):
+            if raw and str(raw).isdigit():
+                after = int(raw)
+
+        # The drainer buffers every upstream event, replays from `after`, and
+        # runs the finalizer on terminal (appending the structured.* event).
+        log = events.ensure_log(run_id, headers, ctx.llm)
 
         response = web.StreamResponse(
             status=200,
@@ -186,123 +214,57 @@ def build_app(ctx) -> web.Application:
         )
         await response.prepare(request)
 
-        upstream_events_ok = False
         try:
-            timeout = ClientTimeout(total=None, sock_read=None)
-            async with ClientSession(timeout=timeout) as session:
-                async with session.get(
-                    f"{cfg.API_BASE}/v1/runs/{run_id}/events", headers=headers
-                ) as upstream_resp:
-                    if upstream_resp.status >= 400:
-                        text = await upstream_resp.text()
-                        # Hermes can return run_not_found for the event stream
-                        # while /v1/runs/{id} still exists and is running. Do not
-                        # surface this as a terminal failure; fall back to polling.
-                        await response.write(
-                            f"event: proxy.fallback\ndata: {json.dumps({'reason': 'upstream_events_unavailable', 'status': upstream_resp.status, 'upstream_error': text})}\n\n".encode()
-                        )
-                    else:
-                        upstream_events_ok = True
-                        async for chunk in upstream_resp.content.iter_chunked(4096):
-                            if chunk:
-                                await response.write(chunk)
+            async for evt in log.subscribe(after_seq=after):
+                await response.write(_sse_frame(evt))
         except (ConnectionResetError, asyncio.CancelledError):
-            return response
-        except Exception as exc:
-            await response.write(
-                f"event: proxy.fallback\ndata: {json.dumps({'reason': 'upstream_events_exception', 'error': str(exc)})}\n\n".encode()
-            )
+            pass
+        except Exception:
+            logger.exception("[structured-runs] event stream failed for %s", run_id)
+        return response
 
-        # After upstream stream ends (or if upstream events are unavailable),
-        # poll status until terminal. This prevents false structured.failed
-        # events for long-running runs whose SSE buffer is unavailable.
-        unknown_since: Optional[float] = None
-        try:
-            while True:
-                status, upstream_status = await upstream.json_request(
-                    "GET", f"/v1/runs/{run_id}", headers=upstream.headers_from_request(request)
-                )
-                if status >= 400:
-                    if status in {401, 403}:
-                        await response.write(
-                            f"event: structured.failed\ndata: {json.dumps({'run_id': run_id, 'structured_error': upstream_status})}\n\n".encode()
-                        )
-                        return response
-                    with _state.LOCK:
-                        meta = copy.deepcopy(_state.runs.get(run_id))
-                    if meta and meta.get("upstream_snapshot"):
-                        upstream_status = copy.deepcopy(meta["upstream_snapshot"])
-                        upstream_status["upstream_status_unavailable"] = True
-                        unknown_since = None
-                    else:
-                        recovered = session_db.session_recovery_snapshot(run_id)
-                        if recovered:
-                            upstream_status = recovered
-                            unknown_since = None
-                        else:
-                            # Upstream has no run record and no recoverable
-                            # session. Give a permanently-missing run a bounded
-                            # grace period instead of polling forever.
-                            now = _now()
-                            if unknown_since is None:
-                                unknown_since = now
-                            elif now - unknown_since >= cfg.SSE_UNKNOWN_TIMEOUT_S:
-                                await response.write(
-                                    f"event: structured.failed\ndata: {json.dumps({'run_id': run_id, 'structured_status': 'failed', 'structured_error': 'run_not_found_upstream', 'upstream_error': upstream_status})}\n\n".encode()
-                                )
-                                return response
-                            await response.write(
-                                f"event: status\ndata: {json.dumps({'run_id': run_id, 'status': 'unknown', 'upstream_error': upstream_status})}\n\n".encode()
-                            )
-                            await asyncio.sleep(3)
-                            continue
-                else:
-                    unknown_since = None
+    async def structured_run_event_log(request: web.Request):
+        """GET /v1/runs/structured/{run_id}/events/log — buffered SSE events as
+        JSON (a plain fetch, unlike the live /events stream). `?after=<seq>`
+        returns only newer events."""
+        run_id = request.match_info["run_id"]
+        headers = upstream.headers_from_request(request)
+        auth_status, auth_data = await upstream.json_request(
+            "GET", "/v1/capabilities", headers=headers, timeout_s=30
+        )
+        if auth_status >= 400:
+            return web.json_response(auth_data, status=auth_status)
 
-                run_state = upstream_status.get("status")
-                if run_state not in cfg.TERMINAL_STATES:
-                    await response.write(
-                        f"event: status\ndata: {json.dumps({'run_id': run_id, 'status': run_state, 'source': 'upstream_sse' if upstream_events_ok else 'poll_fallback'})}\n\n".encode()
-                    )
-                    await asyncio.sleep(3)
-                    continue
+        raw_after = request.query.get("after")
+        after_seq = int(raw_after) if raw_after and raw_after.isdigit() else 0
 
-                if run_state == "completed":
-                    merged = await finalize.finalize_structured(ctx.llm, run_id, upstream_status, headers)
-                else:
-                    with _state.LOCK:
-                        meta = _state.runs.get(run_id)
-                        if meta and not meta.get("structured_done"):
-                            meta["structured_done"] = True
-                            meta["structured_status"] = "skipped"
-                            meta["structured_error"] = f"upstream_{run_state}"
-                            meta["upstream_snapshot"] = copy.deepcopy(upstream_status)
-                            _state.save_state()
-                        merged = finalize.merge_structured(upstream_status, meta)
+        log = events.get_log(run_id)
+        if log is None:
+            with _state.LOCK:
+                known = run_id in _state.runs
+            if not known and session_db.session_recovery_snapshot(run_id) is None:
+                return web.json_response({"error": {"message": "Structured run not found"}}, status=404)
+            log = events.ensure_log(run_id, headers, ctx.llm)
 
-                sstatus = merged.get("structured_status")
-                if sstatus == "completed":
-                    event_name = "structured.completed"
-                elif sstatus == "skipped":
-                    event_name = "structured.skipped"
-                else:
-                    event_name = "structured.failed"
-                payload = {
-                    "run_id": run_id,
-                    "upstream_status": merged.get("status"),
-                    "structured_status": sstatus,
+        with _state.LOCK:
+            meta = _state.runs.get(run_id)
+        merged = finalize.merge_structured({}, meta) if meta else {}
+        return web.json_response(
+            {
+                "run_id": run_id,
+                "closed": log.closed,
+                "upstream_state": log.upstream_state,
+                "next_after": log.events[-1]["seq"] if log.events else after_seq,
+                "events": [e for e in log.events if e["seq"] > after_seq],
+                "structured": {
+                    "structured_status": merged.get("structured_status"),
                     "parsed": merged.get("parsed"),
-                    "content_type": merged.get("content_type"),
-                    "structured_model": merged.get("structured_model"),
-                    "structured_usage": merged.get("structured_usage"),
                     "structured_error": merged.get("structured_error"),
-                }
-                await response.write(
-                    f"event: {event_name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
-                )
-                return response
-        except (ConnectionResetError, asyncio.CancelledError):
-            return response
+                    "structured_validation": merged.get("structured_validation"),
+                    "final_output_check": merged.get("final_output_check"),
+                },
+            }
+        )
 
     async def stop_structured_run(request: web.Request):
         run_id = request.match_info["run_id"]
@@ -356,6 +318,7 @@ def build_app(ctx) -> web.Application:
         )
 
     app.router.add_post("/v1/runs/structured", create_structured_run)
+    app.router.add_get("/v1/runs/structured/{run_id}/events/log", structured_run_event_log)
     app.router.add_get("/v1/runs/structured/{run_id}/events", stream_structured_events)
     app.router.add_get("/v1/runs/structured/{run_id}/media", serve_structured_media)
     app.router.add_post("/v1/runs/structured/{run_id}/stop", stop_structured_run)

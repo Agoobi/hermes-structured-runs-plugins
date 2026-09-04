@@ -113,21 +113,61 @@
       "get": {
         "tags": ["structured-runs"],
         "summary": "SSE stream cho structured run",
-        "description": "Proxy SSE của upstream; nếu upstream events không có sẵn thì fallback sang polling. Chỉ emit một event terminal `structured.completed` / `structured.failed` / `structured.skipped` khi run kết thúc.\n\n**Không có replay / cursor / `Last-Event-ID`.** Kết nối trễ sẽ mất các event trước đó. Sau khi run xong stream đóng.\n\nEvent phát ra: `proxy.fallback`, `status`, `structured.completed`, `structured.failed`, `structured.skipped` (cộng các event thô của upstream khi proxy trực tiếp: `message.delta`, `run.started`, tool progress, ...).",
+        "description": "SSE stream lấy từ **buffer per-run** mà wrapper duy trì (Hermes core không buffer/replay/broadcast event). Mỗi event có `id: <seq>`.\n\n**Replay khi reconnect:** gửi header `Last-Event-ID: <seq>` hoặc query `?after=<seq>` để chỉ nhận event mới hơn.\n\n`: keepalive` mỗi `STRUCTURED_RUNS_SSE_KEEPALIVE_S` giây rảnh. Khi run terminal, wrapper chạy finalizer (dù client không connect) và emit `structured.completed` / `structured.failed` / `structured.skipped`.\n\nEvent: `proxy.fallback`, `status`, `structured.*`, cộng event thô của upstream (`tool.started`, `tool.completed`, `message.delta`, `reasoning.available`, `run.completed`, ...).",
         "operationId": "streamStructuredRunEvents",
         "servers": [{ "url": "http://localhost:8646" }],
-        "parameters": [{ "$ref": "#/components/parameters/RunId" }],
+        "parameters": [
+          { "$ref": "#/components/parameters/RunId" },
+          { "name": "after", "in": "query", "required": false, "schema": { "type": "integer" }, "description": "Chỉ nhận event có `seq` lớn hơn giá trị này (thay cho `Last-Event-ID`)." },
+          { "name": "Last-Event-ID", "in": "header", "required": false, "schema": { "type": "integer" }, "description": "Resume từ seq này (chuẩn SSE)." }
+        ],
         "responses": {
           "200": {
             "description": "`text/event-stream`.",
             "content": {
               "text/event-stream": {
                 "schema": { "type": "string" },
-                "example": "event: status\ndata: {\"run_id\":\"run_abc123\",\"status\":\"running\",\"source\":\"poll_fallback\"}\n\nevent: structured.completed\ndata: {\"run_id\":\"run_abc123\",\"structured_status\":\"completed\",\"parsed\":{\"used_tool\":true}}\n\n"
+                "example": "id: 1\nevent: tool.started\ndata: {\"event\":\"tool.started\",\"tool\":\"terminal\"}\n\nid: 6\nevent: status\ndata: {\"run_id\":\"run_abc123\",\"status\":\"completed\",\"terminal\":true}\n\nid: 7\nevent: structured.completed\ndata: {\"run_id\":\"run_abc123\",\"structured_status\":\"completed\",\"parsed\":{\"used_tool\":true}}\n\n"
               }
             }
           },
           "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/v1/runs/structured/{run_id}/events/log": {
+      "get": {
+        "tags": ["structured-runs"],
+        "summary": "Buffer event dạng JSON (fetch phẳng)",
+        "description": "Trả toàn bộ buffer event của run dưới dạng JSON (không stream), cộng structured result hiện tại. Dùng khi bạn muốn **lấy lại log** sau này thay vì stream trực tiếp. `?after=<seq>` chỉ trả event mới hơn.\n\nBuffer giữ tối đa `STRUCTURED_RUNS_EVENT_LOG_MAX_EVENTS` event, tồn tại `STRUCTURED_RUNS_EVENT_LOG_TTL_S` giây sau khi run close, in-memory (mất khi gateway restart).",
+        "operationId": "getStructuredRunEventLog",
+        "servers": [{ "url": "http://localhost:8646" }],
+        "parameters": [
+          { "$ref": "#/components/parameters/RunId" },
+          { "name": "after", "in": "query", "required": false, "schema": { "type": "integer" }, "description": "Chỉ trả event có `seq` lớn hơn giá trị này." }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/EventLog" },
+                "example": {
+                  "run_id": "run_abc123",
+                  "closed": true,
+                  "upstream_state": "closed",
+                  "next_after": 7,
+                  "events": [
+                    { "seq": 1, "name": "tool.started", "ts": 1788487179.32, "data": { "tool": "terminal" } },
+                    { "seq": 7, "name": "structured.completed", "ts": 1788487190.1, "data": { "structured_status": "completed", "parsed": { "used_tool": true } } }
+                  ],
+                  "structured": { "structured_status": "completed", "parsed": { "used_tool": true }, "structured_error": null, "structured_validation": "enforced", "final_output_check": { "status": "skipped", "reason": "first_pass_schema_valid" } }
+                }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "description": "Structured run không tồn tại.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
         }
       }
     },
@@ -541,6 +581,35 @@
           "usage": { "$ref": "#/components/schemas/StructuredUsage" }
         },
         "additionalProperties": true
+      },
+      "BufferedEvent": {
+        "type": "object",
+        "properties": {
+          "seq": { "type": "integer", "description": "Số thứ tự tăng dần trong run; dùng cho `?after=` / `Last-Event-ID`." },
+          "name": { "type": "string", "description": "Tên event (vd `tool.started`, `message.delta`, `status`, `structured.completed`)." },
+          "ts": { "type": "number", "description": "Unix time lúc wrapper buffer event." },
+          "data": { "type": "object", "additionalProperties": true }
+        }
+      },
+      "EventLog": {
+        "type": "object",
+        "properties": {
+          "run_id": { "type": "string" },
+          "closed": { "type": "boolean", "description": "Drainer đã đóng (run terminal)." },
+          "upstream_state": { "type": "string", "enum": ["pending", "streaming", "poll_fallback", "closed"] },
+          "next_after": { "type": "integer", "description": "`seq` của event cuối — truyền lại làm `?after=` cho lần fetch sau." },
+          "events": { "type": "array", "items": { "$ref": "#/components/schemas/BufferedEvent" } },
+          "structured": {
+            "type": "object",
+            "properties": {
+              "structured_status": { "type": ["string", "null"] },
+              "parsed": { "type": ["object", "null"], "additionalProperties": true },
+              "structured_error": { "type": ["string", "null"] },
+              "structured_validation": { "type": ["string", "null"] },
+              "final_output_check": { "oneOf": [{ "$ref": "#/components/schemas/FinalOutputCheck" }, { "type": "null" }] }
+            }
+          }
+        }
       }
     }
   }

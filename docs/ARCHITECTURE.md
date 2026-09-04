@@ -79,6 +79,7 @@ flowchart TD
     MEDIA["_media.py — path resolve + url enrich"]
     SCHEMA["_schema.py — jsonschema validate"]
     UP["_upstream.py — HTTP client + header allowlist"]
+    EV["_events.py — SSE buffer + fan-out + drainer"]
     STATE["_state.py — registry + persistence"]
     CFG["_config.py — env vars + hằng số"]
 
@@ -86,12 +87,17 @@ flowchart TD
     INIT --> STATE
     INIT --> CFG
     APP --> FIN
+    APP --> EV
     APP --> SDB
     APP --> MEDIA
     APP --> SCHEMA
     APP --> UP
     APP --> STATE
     APP --> CFG
+    EV --> FIN
+    EV --> SDB
+    EV --> STATE
+    EV --> CFG
     FIN --> SDB
     FIN --> MEDIA
     FIN --> SCHEMA
@@ -113,6 +119,7 @@ flowchart TD
 | `_schema.py` | Validate `json_schema` và `parsed` bằng `jsonschema` (optional dep) | `schema_error`, `validate_parsed`, `validation_available` |
 | `_media.py` | Resolve path artifact chống traversal; enrich `*_url` | `resolve_media_path`, `verified_artifacts_from_text`, `canonicalize_artifact_paths`, `enrich_media_urls` |
 | `_upstream.py` | HTTP client tới `:8642`; lọc header theo allowlist | `headers_from_request`, `json_request` |
+| `_events.py` | Buffer + fan-out SSE per-run; drainer giữ 1 subscription upstream, chạy finalizer khi terminal | `RunEventLog`, `ensure_log`, `get_log`, `_drain`, `_ingest_frame` |
 | `_finalize.py` | Post-completion agent check + `complete_structured` finalizer | `finalize_structured`, `post_completion_final_check`, `merge_structured`, `final_output_check_prompt`, `run_output_text` |
 | `_app.py` | Toàn bộ route handler + `build_app(ctx)` | `build_app` |
 
@@ -129,7 +136,8 @@ Tất cả nằm trên `:8646`, forward tới `:8642` (`STRUCTURED_RUNS_UPSTREAM
 |---|---|---|
 | `POST` | `/v1/runs/structured` | Tạo run Hermes bình thường + đính kèm `json_schema` |
 | `GET` | `/v1/runs/structured/:run_id` | Poll; trả `parsed` khi xong |
-| `GET` | `/v1/runs/structured/:run_id/events` | Proxy SSE; fallback polling; emit `structured.*` khi terminal |
+| `GET` | `/v1/runs/structured/:run_id/events` | SSE stream từ buffer; replay bằng `Last-Event-ID` / `?after=`; emit `structured.*` khi terminal |
+| `GET` | `/v1/runs/structured/:run_id/events/log` | Buffer event dạng JSON (fetch phẳng) + structured result hiện tại |
 | `GET` | `/v1/runs/structured/:run_id/media?path=...` | Serve artifact (có auth) |
 | `POST` | `/v1/runs/structured/:run_id/stop` | Passthrough stop |
 | `POST` | `/v1/runs/structured/:run_id/approval` | Passthrough approval |
@@ -406,52 +414,84 @@ stateDiagram-v2
 
 ---
 
-## 7. Luồng 4 — SSE events (`GET .../:run_id/events`)
+## 7. Luồng 4 — SSE events (buffer + fan-out)
+
+### 7.1. Vì sao cần buffer
+
+`GET :8642/v1/runs/:run_id/events` của Hermes core là **một `asyncio.Queue`**
+per-run:
+
+- 2 subscriber **chia nhau** event (mỗi event chỉ tới 1 người);
+- **không replay**, không `Last-Event-ID`;
+- queue bị `pop` ngay khi **bất kỳ** handler nào thoát (client disconnect), kể cả
+  khi run còn chạy → lần sau `/events` → `404`.
+
+Proxy thẳng cái này = client reconnect mất sạch event, chỉ còn poll `status`.
+Wrapper thay bằng: **ngay khi tạo run**, mở **1** subscription upstream duy nhất
+(`_events._drain`), drain vào **buffer có bound** (`RunEventLog`). Client đọc từ
+buffer.
+
+### 7.2. Drainer (`_events._drain`) — 1 task / run
 
 ```mermaid
 flowchart TD
-    START["GET /v1/runs/structured/:run_id/events"] --> PREP["prepare StreamResponse — text/event-stream"]
-    PREP --> PROXY["thử proxy :8642/v1/runs/:run_id/events"]
-    PROXY -- "status < 400" --> STREAM["stream chunk nguyên văn — upstream_events_ok = true"]
-    PROXY -- "status >= 400" --> FB["ghi event proxy.fallback (KHÔNG terminal)"]
-    PROXY -- "ConnectionReset / Cancelled" --> RET1["return — client đóng"]
+    C["create_structured_run → ensure_log(run_id, headers, llm)"] --> D0["asyncio.create_task(_drain)"]
+    D0 --> D1["GET :8642/v1/runs/:run_id/events (giữ mở)"]
+    D1 -- "200" --> D2["đọc từng frame → _ingest_frame → log.append(name, data)<br/>fan-out tới mọi subscriber"]
+    D1 -- ">= 400" --> D3["log.append(proxy.fallback)"]
+    D2 --> D4["stream kết thúc (run xong / lỗi)"]
+    D3 --> POLL
+    D4 --> POLL
 
-    STREAM --> LOOP
-    FB --> LOOP
-
-    subgraph LOOP["POLL LOOP — unknown_since = None"]
-        P1["GET :8642/v1/runs/:run_id"] --> P2{"status >= 400 ?"}
-        P2 -- "401 / 403" --> EF["ghi event structured.failed rồi return"]
-        P2 -- "có upstream_snapshot" --> USE1["dùng snapshot; unknown_since = None"]
-        P2 -- "session_recovery_snapshot OK" --> USE2["dùng recovered; unknown_since = None"]
-        P2 -- "không gì cả" --> GRACE{"now - unknown_since >= SSE_UNKNOWN_TIMEOUT_S ? (90s)"}
-        GRACE -- "chưa" --> UNK["ghi event status (unknown); sleep 3; LẶP"]
-        GRACE -- "rồi" --> EF2["ghi event structured.failed — run_not_found_upstream; return"]
-        P2 -- "OK" --> USE3["unknown_since = None"]
-
-        USE1 --> TERM
-        USE2 --> TERM
-        USE3 --> TERM
-        TERM{"run_state in TERMINAL_STATES ? — completed/failed/cancelled"}
-        TERM -- "chưa" --> STAT["ghi event status — source upstream_sse hoặc poll_fallback; sleep 3; LẶP"]
-        TERM -- "completed" --> FINCALL["merged = finalize_structured(ctx.llm, ...)"]
-        TERM -- "failed / cancelled" --> SKIPX["mark structured_done + skipped + snapshot; merged = merge_structured"]
-        FINCALL --> EMIT
-        SKIPX --> EMIT
-        EMIT["event_name theo merged.structured_status — completed→structured.completed, skipped→structured.skipped, còn lại→structured.failed; ghi payload; return"]
+    subgraph POLL["_poll_until_terminal — unknown_since"]
+        Q1["GET :8642/v1/runs/:run_id"] --> Q2{"status ?"}
+        Q2 -- "401/403" --> QF["log.append(structured.failed) + close"]
+        Q2 -- "4xx + có snapshot / recover được" --> QU["dùng snapshot/recovered"]
+        Q2 -- "4xx + không gì, quá SSE_UNKNOWN_TIMEOUT_S (90s)" --> QF2["log.append(structured.failed: run_not_found_upstream) + close"]
+        Q2 -- "4xx + không gì, chưa quá" --> QUNK["log.append(status: unknown); sleep 3; LẶP"]
+        Q2 -- "OK, chưa terminal" --> QST["log.append(status); sleep 3; LẶP"]
+        QU --> QT
+        Q2 -- "OK, terminal" --> QT
+        QT["log.append(status: terminal)"] --> QFIN["_finalize_terminal: finalize_structured(llm) 1 lần<br/>→ log.append(structured.completed/failed/skipped)"]
+        QFIN --> QC["log.close()"]
     end
-
-    LOOP -. "ConnectionReset / Cancelled" .-> RET2["return — client đóng"]
 ```
+
+**Điểm mấu chốt:** finalizer chạy **trong drainer** khi terminal → structured
+result được tạo kể cả khi client chỉ dùng SSE rồi disconnect sớm, hoặc **không
+connect lần nào**. Poll endpoint vẫn finalize độc lập (idempotent).
+
+### 7.3. `RunEventLog.subscribe(after_seq)` — mỗi client
+
+```mermaid
+flowchart TD
+    S0["stream_structured_events: after = Last-Event-ID | ?after= | 0"] --> S1["ensure_log(...) → RunEventLog"]
+    S1 --> S2["prepare StreamResponse; subscribe(after_seq=after)"]
+    S2 --> S3["yield backlog: mọi event seq > after (replay)"]
+    S3 --> S4{"loop: q.get() timeout SSE_KEEPALIVE_S (15s)"}
+    S4 -- "event" --> S5["yield (seq > last) → ghi frame: id/event/data"]
+    S4 -- "timeout" --> S6["yield keepalive → ghi ': keepalive'"]
+    S4 -- "None (log.close)" --> S7["drain event còn lại rồi kết thúc"]
+    S5 --> S4
+    S6 --> S4
+    S7 --> S8["handler return (client tự đóng, hoặc gặp structured.*)"]
+```
+
+### 7.4. `GET .../events/log`
+
+Fetch phẳng (không stream): trả `{run_id, closed, upstream_state, next_after,
+events: [...], structured: {structured_status, parsed, ...}}`. `?after=<seq>` chỉ
+trả event mới hơn. Nếu chưa có log (plugin vừa restart) thì `ensure_log` khởi
+động drainer mới.
 
 **Tên event SSE (contract — đổi là breaking):**
 `proxy.fallback`, `status`, `structured.completed`, `structured.failed`,
-`structured.skipped`.
+`structured.skipped`; cộng event thô của upstream (`tool.started`,
+`tool.completed`, `message.delta`, `reasoning.available`, `run.completed`, ...).
 
-**Vì sao có poll-fallback:** buffer SSE của Hermes có thể không có sẵn cho run
-chạy lâu. Không được emit `structured.failed` giả chỉ vì stream lỗi — phải poll
-`/v1/runs/:id` tới khi terminal thật. Nhưng nếu run **hoàn toàn không tồn tại**
-(cả registry lẫn session), sau `SSE_UNKNOWN_TIMEOUT_S` mới bỏ cuộc.
+**Bound:** `EVENT_LOG_MAX_EVENTS` / run, giữ `EVENT_LOG_TTL_S` sau khi close,
+tối đa `EVENT_LOG_MAX_RUNS` log (drop closed cũ nhất). In-memory — restart mất
+event trước đó.
 
 ---
 
@@ -637,7 +677,11 @@ lỗi/timeout → giữ output gốc). Mọi field mới thêm phải đi qua `m
 | `STRUCTURED_RUNS_SESSION_SETTLE_TIMEOUT_S` | `180` | Chờ tối đa cho delegation của session settle |
 | `STRUCTURED_RUNS_SESSION_QUIET_S` | `3` | Khoảng lặng cần có sau khi delegation deliver |
 | `STRUCTURED_RUNS_SESSION_SETTLE_POLL_INTERVAL_S` | `1` | Nhịp check delegation state |
-| `STRUCTURED_RUNS_SSE_UNKNOWN_TIMEOUT_S` | `90` | Grace trước khi SSE bỏ cuộc cho run không tồn tại |
+| `STRUCTURED_RUNS_SSE_UNKNOWN_TIMEOUT_S` | `90` | Grace trước khi drainer bỏ cuộc cho run không tồn tại |
+| `STRUCTURED_RUNS_SSE_KEEPALIVE_S` | `15` | Nhịp `: keepalive` trên stream `/events` |
+| `STRUCTURED_RUNS_EVENT_LOG_MAX_EVENTS` | `3000` | Số event buffer tối đa / run |
+| `STRUCTURED_RUNS_EVENT_LOG_TTL_S` | `600` | Giữ buffer bao lâu sau khi run close (cho replay trễ) |
+| `STRUCTURED_RUNS_EVENT_LOG_MAX_RUNS` | `500` | Số run có buffer tối đa (drop closed cũ nhất) |
 | `STRUCTURED_RUNS_STATE_DB_BUSY_TIMEOUT_S` | `5` | SQLite busy timeout khi đọc `state.db` |
 | `STRUCTURED_RUNS_RETENTION_S` | `604800` (7 ngày) | Run finished cũ hơn ngần này bị drop. `0` = tắt |
 | `STRUCTURED_RUNS_MAX_TRACKED` | `2000` | Cap số run tracked; drop oldest finished. `0` = tắt |
@@ -673,9 +717,14 @@ lỗi/timeout → giữ output gốc). Mọi field mới thêm phải đi qua `m
    không đụng registry), `post_completion_final_check`, `finalize_structured`
    (7 bước ở §6, với fast-path/escalate theo `FINAL_CHECK_MODE`).
    `finalize_structured` nhận `llm` làm tham số, không đóng closure trên `ctx`.
-10. **`_app.py`**: `build_app(ctx)` định nghĩa 7 handler + đăng ký router. Handler
-    gọi `finalize.finalize_structured(ctx.llm, ...)`.
-11. **Tests** (`tests/_plugin.py` là loader chung mô phỏng Hermes core:
+10. **`_events.py`**: `RunEventLog` (buffer + `_subs` fan-out + `subscribe(after_seq)`
+    có keepalive), `ensure_log(run_id, headers, llm)` (idempotent, 1 drainer/run),
+    `_drain` → `_ingest_frame` → `_poll_until_terminal` → `_finalize_terminal`
+    (gọi `finalize_structured` khi terminal). `_gc_logs` bound theo TTL + cap.
+11. **`_app.py`**: `build_app(ctx)` định nghĩa các handler + đăng ký router.
+    `create_structured_run` gọi `events.ensure_log` để bắt event từ t0;
+    `stream_structured_events` chỉ relay `log.subscribe`.
+12. **Tests** (`tests/_plugin.py` là loader chung mô phỏng Hermes core:
     `spec_from_file_location(..., submodule_search_locations=[dir])` +
     `__package__` + `sys.modules[...]`).
 

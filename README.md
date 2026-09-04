@@ -19,6 +19,7 @@ relative imports.
 | `_schema.py` | Optional `jsonschema` validation of the finalizer contract. |
 | `_media.py` | Artifact path resolution (traversal-safe) + media-URL enrichment. |
 | `_upstream.py` | Allowlisted HTTP client for the real API server. |
+| `_events.py` | Per-run SSE event buffer + fan-out; the drainer also runs the finalizer on terminal. |
 | `_finalize.py` | Post-completion agent check + `complete_structured` finalizer. |
 | `_app.py` | The aiohttp routes. |
 
@@ -26,7 +27,8 @@ relative imports.
 
 - `POST /v1/runs/structured` — create a normal Hermes run, plus `json_schema` for the final response.
 - `GET /v1/runs/structured/{run_id}` — poll the upstream run and return `parsed` JSON once complete.
-- `GET /v1/runs/structured/{run_id}/events` — proxy upstream SSE events, fall back to polling if upstream events are unavailable, and emit a final `structured.completed` / `structured.failed` / `structured.skipped` event only when terminal. If upstream never has a record of the run and no session can be recovered, the poll-fallback gives up after `STRUCTURED_RUNS_SSE_UNKNOWN_TIMEOUT_S` with `structured.failed` (`structured_error: "run_not_found_upstream"`) instead of polling forever.
+- `GET /v1/runs/structured/{run_id}/events` — SSE stream backed by a **per-run event buffer** (see below). Supports reconnect with replay via `Last-Event-ID` or `?after=<seq>`. Emits a final `structured.completed` / `structured.failed` / `structured.skipped` event when terminal.
+- `GET /v1/runs/structured/{run_id}/events/log` — the buffered events as a plain JSON array (a normal fetch, not a stream), plus the current structured result. `?after=<seq>` returns only newer events.
 - `POST /v1/runs/structured/{run_id}/stop` — pass through to upstream run stop.
 - `POST /v1/runs/structured/{run_id}/approval` — pass through approval responses.
 - The finalizer first launches a **post-completion agent check in the same session** (by default only when finalizing the agent's own output is not schema-valid — see `STRUCTURED_RUNS_FINAL_CHECK_MODE`).
@@ -150,6 +152,19 @@ If the agent turn cannot start, fails, or exceeds its deadline, the wrapper pres
 
 If the durable delegation state cannot be read (a locked `state.db` or a Hermes-core schema change), the settle step does **not** treat that as "nothing pending": it keeps polling until `STRUCTURED_RUNS_SESSION_SETTLE_TIMEOUT_S` and reports `session_settle.status = "timeout"`. A deployment with no `state.db` at all reports `"unavailable"` and skips the wait. A warning is logged when a query against `state.db` fails.
 
+## Run events
+
+Hermes core's `/v1/runs/{id}/events` is a single `asyncio.Queue` per run: a second subscriber steals events from the first, there is no replay, and the queue is dropped the moment any subscriber disconnects — even mid-run. Proxying it directly means a client that reconnects loses everything and only sees `status` polling afterwards.
+
+Instead, from the moment a structured run is created the wrapper opens **one** upstream events subscription and drains it into a bounded per-run buffer:
+
+- `GET .../events` replays the buffer (or from `Last-Event-ID` / `?after=<seq>`), then tails new events, with `: keepalive` comments every `STRUCTURED_RUNS_SSE_KEEPALIVE_S`.
+- `GET .../events/log` returns the buffer as JSON (`events`, `next_after`, `closed`, `upstream_state`) plus the current `structured` result.
+- when the run reaches a terminal state the drainer runs the finalizer once and appends the `structured.*` event — so the structured result is produced even if the only client used SSE and disconnected early, or never connected at all.
+- if upstream has no record of the run and no session can be recovered, the drainer emits `structured.failed` (`structured_error: "run_not_found_upstream"`) after `STRUCTURED_RUNS_SSE_UNKNOWN_TIMEOUT_S` instead of polling forever.
+
+Buffers hold up to `STRUCTURED_RUNS_EVENT_LOG_MAX_EVENTS` events, survive `STRUCTURED_RUNS_EVENT_LOG_TTL_S` after the run closes (for late replay), and are capped at `STRUCTURED_RUNS_EVENT_LOG_MAX_RUNS` runs. They are in-memory only — a gateway restart loses events from before the restart.
+
 ## Crash recovery
 
 `_finalize_structured` marks a run `structured_status = "running"` before its settle / final-check / finalizer steps. If the gateway restarts during that window, the wrapper rewinds any such run (that has not reached `structured_done`) back to `pending` on load, so the next poll re-runs the finalizer.
@@ -199,6 +214,10 @@ Environment variables:
 | `STRUCTURED_RUNS_SESSION_QUIET_S` | `3` | Required quiet window after delegated output delivery. |
 | `STRUCTURED_RUNS_SESSION_SETTLE_POLL_INTERVAL_S` | `1` | Seconds between durable delegation-state checks. |
 | `STRUCTURED_RUNS_SSE_UNKNOWN_TIMEOUT_S` | `90` | Grace period before the SSE poll-fallback emits `structured.failed` for a run that upstream has no record of and no recoverable session. |
+| `STRUCTURED_RUNS_SSE_KEEPALIVE_S` | `15` | Idle interval between `: keepalive` comments on the `/events` stream. |
+| `STRUCTURED_RUNS_EVENT_LOG_MAX_EVENTS` | `3000` | Max events buffered per run. |
+| `STRUCTURED_RUNS_EVENT_LOG_TTL_S` | `600` | How long a closed run's event buffer is kept for late replay. |
+| `STRUCTURED_RUNS_EVENT_LOG_MAX_RUNS` | `500` | Max runs with a live event buffer (oldest closed dropped first). |
 | `STRUCTURED_RUNS_STATE_DB_BUSY_TIMEOUT_S` | `5` | SQLite busy timeout when reading Hermes `state.db` (it is written by Hermes core). |
 | `STRUCTURED_RUNS_RETENTION_S` | `604800` (7 days) | Finished runs older than this are dropped from the registry / state file. `0` disables. |
 | `STRUCTURED_RUNS_MAX_TRACKED` | `2000` | Hard cap on tracked runs; oldest finished runs are dropped first once exceeded. In-flight runs are never dropped. `0` disables. |
