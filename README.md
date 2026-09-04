@@ -138,6 +138,27 @@ If the agent turn cannot start, fails, or exceeds its deadline, the wrapper pres
 
 If the durable delegation state cannot be read (a locked `state.db` or a Hermes-core schema change), the settle step does **not** treat that as "nothing pending": it keeps polling until `STRUCTURED_RUNS_SESSION_SETTLE_TIMEOUT_S` and reports `session_settle.status = "timeout"`. A deployment with no `state.db` at all reports `"unavailable"` and skips the wait. A warning is logged when a query against `state.db` fails.
 
+## Verbatim fields (`x-verbatim-from-output`)
+
+Asking the finalizer LLM to reproduce a large body of text (a multi-thousand-word article, say) into a JSON string field is unreliable: it is a separate, context-free completion call — no memory of having written the text, just the raw `output` and the schema — and it has been observed live to settle on an empty string for that field rather than copy it, even though the schema's own `description` explicitly asked for the full text verbatim (the schema, `description` fields included, is sent to the model both as plain prompt text and as the `response_format.json_schema.schema` structured-output contract — the model does see the instruction, it just doesn't reliably follow it for large copy tasks).
+
+Mark **at most one** top-level string property `x-verbatim-from-output: true` to sidestep this instead of relying on the LLM to reproduce it:
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "title":   { "type": "string" },
+    "content": { "type": "string", "x-verbatim-from-output": true }
+  },
+  "required": ["title", "content"]
+}
+```
+
+The finalizer never asks the LLM to fill a field marked this way — whatever it returns for that field is discarded, and the field is overwritten with the run's own output text (the raw `output` on the first pass, the post-completion re-check's corrected output if that ran), clipped to `STRUCTURED_RUNS_MAX_OUTPUT_CHARS`. The field cannot come back hollow because it is never the LLM's to fill.
+
+`x-verbatim-from-output` is a vendor-extension keyword (the `x-` prefix), so plain `jsonschema` validation ignores it on any run that doesn't use it. `POST /v1/runs/structured` rejects a schema with more than one such property, or one on a non-`string` property, with `400 invalid_request_error` — there is only one `output` blob to substitute, so a second marked field would receive the exact same text, which is never the intent. A schema that genuinely needs more than one large verbatim block should be split into separate structured runs, each producing its own `output` for its own field, rather than marking several fields in one run.
+
 ## Terminal structured state
 
 A completed run always ends at a terminal `structured_status` — `completed`, `failed` or `skipped`. It is never left at `running` with nobody working on it, because a client cannot tell that apart from "result lost":
