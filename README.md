@@ -139,16 +139,44 @@ Example completed response:
 
 Every successful structured run first waits for its own background delegations to complete and be delivered, then takes the newest persisted assistant reply from the same session. This avoids freezing an early final answer while QA or other `delegate_task` work is still returning.
 
-Then the wrapper tries to finalize **the agent's own output** into schema-valid JSON:
+**Attempt 0** — finalize **the agent's own output** into schema-valid JSON (`llm.complete_structured`, no agent turn).
 
-- If that first pass is schema-valid (and `jsonschema` is installed), the run completes there. `final_output_check` is `{"status":"skipped","reason":"first_pass_schema_valid"}` — no extra agent turn is spent.
-- If it is **not** schema-valid, the wrapper runs a **post-completion agent turn in the same session**: the agent reviews the client JSON Schema and returns a corrected final answer, which is then finalized. `final_output_check` is `{"status":"completed","run_id":"run_yyy"}`.
+- If it is schema-valid (and `jsonschema` is installed), the run completes there. No agent turn is spent.
+- If not, the wrapper runs **re-check agent turns in the same session**: the agent reviews the client JSON Schema and returns a corrected final answer, which is finalized again. This loops up to `STRUCTURED_RUNS_FINAL_CHECK_MAX_ATTEMPTS` (default 3, **hard cap 7**), feeding the last validation error into each retry prompt. The first attempt that produces valid JSON is committed.
 
-`STRUCTURED_RUNS_FINAL_CHECK_MODE` overrides this: `always` runs the agent turn on every completed run (legacy behavior); `off` never runs it and commits the first-pass result as-is (`{"status":"skipped","reason":"final_check_disabled"}`).
+`STRUCTURED_RUNS_FINAL_CHECK_MODE`: `auto` (default, re-check only when needed) · `always` (at least one re-check every run) · `off` (never re-check).
 
-The wrapper resolves any artifact path mentioned in the reply against `STRUCTURED_RUNS_MEDIA_ROOTS` **before** the finalizer runs. Verified paths are passed to the agent (when the re-check runs) as authoritative absolute paths, so a follow-up is never dependent on the gateway's current working directory. The finalizer canonicalizes existing `*_path` values to bare absolute paths; `MEDIA:` remains a delivery marker, not the value stored in JSON.
+`STRUCTURED_RUNS_FINAL_CHECK_STOP_ON_FALLBACK` (default 2): stop the loop early after this many consecutive re-checks whose agent turn could not run.
 
-If the agent turn cannot start, fails, or exceeds its deadline, the wrapper preserves the original completed output and reports `{"status":"fallback","error":"..."}` in `final_output_check`; it never silently drops a valid upstream result.
+Every attempt is recorded in `final_output_check`:
+
+```json
+{
+  "status": "skipped" | "completed" | "exhausted" | "fallback",
+  "reason": "first_pass_schema_valid" | "final_check_disabled" | null,
+  "recheck_attempts": 2,
+  "resolved_on_attempt": 2,
+  "last_recheck_run_id": "run_zzz",
+  "history": [
+    { "attempt": 0, "kind": "agent_output",  "outcome": "invalid", "validation_error": "...", "finalizer_text_preview": "..." },
+    { "attempt": 1, "kind": "agent_recheck", "recheck_run_id": "run_yyy", "recheck_status": "completed", "outcome": "invalid", "validation_error": "..." },
+    { "attempt": 2, "kind": "agent_recheck", "recheck_run_id": "run_zzz", "recheck_status": "completed", "outcome": "valid" }
+  ]
+}
+```
+
+| `status` | meaning |
+|---|---|
+| `skipped` | no re-check (attempt 0 valid in `auto`, or `mode=off`) |
+| `completed` | a re-check produced valid JSON (`resolved_on_attempt`) |
+| `exhausted` | ran all `MAX_ATTEMPTS`, still not valid → `structured_status: "failed"` |
+| `fallback` | stopped early because agent turns kept failing to run |
+
+**Cost/latency**: worst case is `MAX_ATTEMPTS` agent turns (each ~30–60s + tools + tokens) and `MAX_ATTEMPTS + 1` finalizer calls; `structured_status` stays `running` for the whole loop. Each re-check also adds a user/assistant message pair to the session. Keep `MAX_ATTEMPTS` low (2–3) unless a schema is genuinely hard.
+
+The wrapper resolves any artifact path mentioned in the reply against `STRUCTURED_RUNS_MEDIA_ROOTS` **before** the finalizer runs. Verified paths are passed to the agent (when a re-check runs) as authoritative absolute paths. The finalizer canonicalizes existing `*_path` values to bare absolute paths; `MEDIA:` remains a delivery marker.
+
+A re-check that cannot start, fails, or times out falls back to the original completed output — it never erases a valid result.
 
 If the durable delegation state cannot be read (a locked `state.db` or a Hermes-core schema change), the settle step does **not** treat that as "nothing pending": it keeps polling until `STRUCTURED_RUNS_SESSION_SETTLE_TIMEOUT_S` and reports `session_settle.status = "timeout"`. A deployment with no `state.db` at all reports `"unavailable"` and skips the wait. A warning is logged when a query against `state.db` fails.
 
@@ -207,8 +235,11 @@ Environment variables:
 |---|---|---|
 | `STRUCTURED_RUNS_UPSTREAM` | `http://127.0.0.1:8642` | Upstream Hermes API server. |
 | `STRUCTURED_RUNS_MAX_OUTPUT_CHARS` | `200000` | Max raw output passed into the finalizer. |
-| `STRUCTURED_RUNS_FINAL_CHECK_MODE` | `auto` | When the post-completion agent re-check runs: `auto` = only when finalizing the agent's own output is not schema-valid; `always` = every completed run (legacy); `off` = never. |
-| `STRUCTURED_RUNS_FINAL_CHECK_TIMEOUT_S` | `120` | Maximum time for the post-completion agent correction turn. |
+| `STRUCTURED_RUNS_FINAL_CHECK_MODE` | `auto` | When the re-check runs: `auto` = only when the finalizer output is not schema-valid; `always` = at least one re-check per run; `off` = never. |
+| `STRUCTURED_RUNS_FINAL_CHECK_MAX_ATTEMPTS` | `3` | Max re-check agent turns (attempt 0 excluded). **Hard-clamped to `[0, 7]`.** |
+| `STRUCTURED_RUNS_FINAL_CHECK_STOP_ON_FALLBACK` | `2` | Stop the loop after this many consecutive re-checks whose agent turn could not run (`0` disables). |
+| `STRUCTURED_RUNS_FINAL_CHECK_TEXT_PREVIEW_CHARS` | `500` | Chars of raw finalizer text kept per `final_output_check.history` entry. |
+| `STRUCTURED_RUNS_FINAL_CHECK_TIMEOUT_S` | `120` | Maximum time for one re-check agent turn. |
 | `STRUCTURED_RUNS_FINAL_CHECK_POLL_INTERVAL_S` | `1` | Seconds between status checks for that correction turn. |
 | `STRUCTURED_RUNS_SESSION_SETTLE_TIMEOUT_S` | `180` | Max wait for this session's background delegations/delivery before finalization. |
 | `STRUCTURED_RUNS_SESSION_QUIET_S` | `3` | Required quiet window after delegated output delivery. |

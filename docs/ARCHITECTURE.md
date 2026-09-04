@@ -20,9 +20,9 @@ Wrapper chỉ thêm 3 thứ lên trên `/v1/runs`:
 
 1. **Schema finalizer** — sau khi run xong, ép output cuối của agent thành JSON
    đúng `json_schema` client gửi (`llm.complete_structured`).
-2. **Post-completion agent check** — một lượt agent bổ sung *trong cùng session*
-   để agent tự sửa câu trả lời cuối theo schema. Mặc định (`auto`) chỉ chạy khi
-   finalize output gốc của agent không ra JSON hợp schema.
+2. **Post-completion re-check** — khi finalize output gốc không ra JSON hợp
+   schema, chạy tới `FINAL_CHECK_MAX_ATTEMPTS` (clamp `[0,7]`) lượt agent *trong
+   cùng session* để agent tự sửa, mỗi lượt feed lỗi validate của lượt trước.
 3. **Media route** — serve file artifact (video/audio/image/PDF...) có auth,
    chống path traversal.
 
@@ -316,47 +316,44 @@ sequenceDiagram
     end
 
     rect rgb(253,238,244)
-    note over F,SC: BƯỚC 5 — fast path (mode auto/off): thử finalize output GỐC của agent
+    note over F,SC: BƯỚC 5 — attempt 0: finalize output GỐC của agent (không agent turn)
     F->>M: verified_artifacts_from_text(original_output)
     M-->>F: danh sách absolute path đã xác minh tồn tại dưới MEDIA_ROOTS
     F->>F: _extract_json(original_output + artifact_suffix)
-    F->>LLM: complete_structured(temperature 0.0) qua asyncio.to_thread
-    LLM-->>F: result — parsed, text, model, usage
-    F->>M: canonicalize_artifact_paths + enrich_media_urls
-    F->>SC: validate_parsed(parsed, schema)
-    alt mode == off, HOẶC (jsonschema có và validation_error is None)
-        Note over F: first_pass_ok — final_output_check = status skipped<br/>KHÔNG chạy agent re-check → nhảy tới BƯỚC 7
+    F->>LLM: complete_structured(temperature 0.0)
+    LLM-->>F: result — parsed / exc
+    F->>SC: canonicalize + enrich + validate_parsed
+    F->>F: ghi history[0], committed = extract nếu hợp schema
+    alt mode == off — HOẶC (mode == auto và attempt 0 hợp schema)
+        Note over F: final_output_check.status = skipped → nhảy BƯỚC 7
     end
     end
 
     rect rgb(235,242,253)
-    note over F,UP: BƯỚC 6 — escalate: chỉ chạy khi first pass KHÔNG đạt schema (mode auto) hoặc mode always
-    F->>PC: post_completion_final_check(run_id, upstream_status, schema, headers, verified_artifacts)
-    PC->>UP: POST /v1/runs — input là final_output_check_prompt, cùng session_id
-    alt start fail
-        PC-->>F: (original_output, status fallback)
-    else poll GET /v1/runs/:check_run_id tới FINAL_CHECK_TIMEOUT_S (120s)
-        alt completed và output non-empty
+    note over F,UP: BƯỚC 6 — RE-CHECK LOOP (n = 1 .. FINAL_CHECK_MAX_ATTEMPTS, clamp [0,7])
+    loop tới khi hợp schema, hết attempt, hoặc STOP_ON_FALLBACK fallback liên tiếp
+        F->>PC: post_completion_final_check(attempt=n, prior_error=lỗi validate gần nhất, prior_parsed_preview)
+        PC->>UP: POST /v1/runs — retry prompt + session_id
+        alt agent turn chạy xong
             PC-->>F: (checked_output, status completed)
-        else completed rỗng / failed / cancelled / timeout
+        else start fail / timeout / failed
             PC-->>F: (original_output, status fallback)
         end
+        F->>F: _extract_json(checked_output) → validate → ghi history[n]
+        alt hợp schema
+            Note over F: committed = extract, resolved_on_attempt = n, BREAK
+        end
     end
-    F->>F: _extract_json(checked_output + artifact_suffix) — finalize lần 2
-    F->>LLM: complete_structured
-    LLM-->>F: result
+    Note over F: fc_status = completed | exhausted | fallback
     end
 
     rect rgb(235,248,238)
-    note over F,ST: BƯỚC 7 — commit kết quả
-    F->>ST: runs[run_id].final_output_check + verified_artifacts, rồi save_state()
-    Note over F,ST: structured_validation = "enforced" | "skipped_no_jsonschema"
-    alt exc (complete_structured raise)
-        F->>ST: structured_status failed, structured_error = str(exc)
-    else validation_error
-        F->>ST: structured_status failed, structured_error, parsed None, raw_structured_text
-    else OK
-        F->>ST: structured_status completed, parsed = parsed
+    note over F,ST: BƯỚC 7 — commit
+    F->>ST: runs[run_id].final_output_check (đủ history) + verified_artifacts, rồi save_state()
+    alt committed None (không attempt nào hợp schema)
+        F->>ST: structured_status = failed, structured_error = lỗi attempt cuối, parsed = null, raw_structured_text
+    else
+        F->>ST: structured_status = completed, parsed = attempt committed
     end
     ST->>ST: save_state()
     end
@@ -365,10 +362,15 @@ sequenceDiagram
     F-->>CALLER: merged response
 ```
 
-> `STRUCTURED_RUNS_FINAL_CHECK_MODE`: `auto` (mặc định, sơ đồ trên) — `always`
-> bỏ BƯỚC 5, luôn chạy BƯỚC 6 — `off` chạy BƯỚC 5 rồi commit thẳng (không bao
-> giờ BƯỚC 6). Không có `jsonschema` thì first pass không thể "đạt schema" nên
-> `auto` luôn escalate.
+> **mode**: `auto` (sơ đồ trên) — `always` luôn chạy ít nhất 1 vòng BƯỚC 6 kể cả
+> khi attempt 0 hợp schema — `off` commit thẳng attempt 0. Không có `jsonschema`
+> thì attempt 0 không thể "hợp schema" nên `auto` luôn vào loop.
+>
+> `final_output_check` = `{status, reason, recheck_attempts, resolved_on_attempt,
+> last_recheck_run_id, history: [{attempt, kind, recheck_run_id, recheck_status,
+> outcome: valid|invalid|finalizer_error, validation_error, finalizer_text_preview}]}`.
+> `status`: `skipped` | `completed` | `exhausted` (hết attempt) | `fallback`
+> (dừng vì agent turn liên tục không chạy được).
 
 ### 6.2. Vì sao mỗi bước tồn tại
 
@@ -378,9 +380,9 @@ sequenceDiagram
 | **2. `wait_for_session_settle`** | `/v1/runs` có thể báo `completed` trong khi `delegate_task` chạy nền vẫn đang deliver kết quả vào cùng session. Finalize ngay = chụp reply cũ. Chờ tới khi `async_delegations` của session này delivered hết + có khoảng lặng (`SESSION_QUIET_S`). **Nếu không đọc được `state.db` thì KHÔNG coi là settled** — chờ tới timeout (tránh finalize trên reply cũ khi DB chỉ lock tạm). |
 | **3. `latest_session_output`** | Sau settle, lấy reply `assistant` mới nhất thật sự (bỏ tool-call placeholder), thay cho `output` terminal đầu tiên. |
 | **4. persist snapshot** | Hermes giữ run status rất ngắn. Sau restart / hết retention, `/v1/runs/:id` trả `404` trong khi wrapper vẫn còn schema + kết quả. Lưu terminal snapshot để poll vẫn deterministic. |
-| **5. fast path** | Nếu output agent đã đủ tốt để `complete_structured` cho ra JSON hợp schema thì **không cần** làm phiền agent thêm một lượt. Tiết kiệm nguyên một agent turn (tới 120s + tool + token). `verified_artifacts`: path tương đối phụ thuộc cwd — wrapper resolve sẵn về absolute (đã xác minh file tồn tại dưới `MEDIA_ROOTS`) và append vào input finalizer / đưa cho agent như "authoritative". |
-| **6. escalate** | Chỉ khi first pass **không** hợp schema (mode `auto`), hoặc luôn (mode `always`): một lượt agent *thật* trong **cùng `session_id`** để agent tự rà theo schema và sửa. Fail/timeout → fallback về output gốc, **không bao giờ xoá** kết quả hợp lệ. Rồi finalize lại lần 2. |
-| **7. `complete_structured`** | Bước tạo JSON cuối. `temperature=0.0`. Không bịa field ngoài schema. `canonicalize`: `*_path` → bare absolute path. `enrich`: `*_url` chỉ thêm nếu schema/finalizer đã khai báo key đó. `validate_parsed`: không có `jsonschema` → không fail run nhưng `structured_validation: "skipped_no_jsonschema"` + log warning. |
+| **5. attempt 0** | Nếu output agent đã đủ tốt để `complete_structured` cho ra JSON hợp schema thì **không cần** làm phiền agent. `verified_artifacts`: path tương đối phụ thuộc cwd — wrapper resolve sẵn về absolute (đã xác minh tồn tại dưới `MEDIA_ROOTS`) rồi append vào input finalizer / đưa agent như "authoritative". |
+| **6. re-check loop** | Khi attempt 0 lệch schema (mode `auto`) hoặc luôn (mode `always`): tối đa `FINAL_CHECK_MAX_ATTEMPTS` (clamp `[0,7]`) lượt agent *thật* trong **cùng `session_id`**, mỗi lượt được feed lỗi validate của lượt trước. Attempt đầu tiên ra JSON hợp lệ được commit. Fail/timeout → fallback output gốc, **không xoá** kết quả hợp lệ. Dừng sớm nếu `STOP_ON_FALLBACK` recheck liên tiếp không chạy được agent turn. **Đánh đổi**: worst case = `MAX_ATTEMPTS` agent turn (vài phút) + `MAX_ATTEMPTS+1` finalizer call + `MAX_ATTEMPTS` cặp message thêm vào session. |
+| **7. commit + history** | `temperature=0.0`, không bịa field ngoài schema. `canonicalize`: `*_path` → bare absolute. `enrich`: `*_url` chỉ thêm nếu key đã khai báo. Không `jsonschema` → không fail nhưng `structured_validation: "skipped_no_jsonschema"`. Toàn bộ attempt ghi vào `final_output_check.history`. |
 
 ### 6.3. State machine của `structured_status`
 
@@ -651,16 +653,26 @@ flowchart TD
   "structured_error": null,
   "structured_schema_name": "run.finalizer",
   "structured_validation": "enforced",
-  "final_output_check": { "status": "skipped", "reason": "first_pass_schema_valid" },
+  "final_output_check": {
+    "status": "completed",
+    "reason": null,
+    "recheck_attempts": 1,
+    "resolved_on_attempt": 1,
+    "last_recheck_run_id": "run_yyy",
+    "history": [
+      { "attempt": 0, "kind": "agent_output",  "outcome": "invalid", "validation_error": "..." },
+      { "attempt": 1, "kind": "agent_recheck", "recheck_run_id": "run_yyy", "recheck_status": "completed", "outcome": "valid" }
+    ]
+  },
   "session_settle": { "status": "settled" },
   "verified_artifacts": ["/root/.hermes/media/run_xxx/out.mp4"]
 }
 ```
 
-`final_output_check.status` có thể là: `skipped` (fast path đạt schema, hoặc mode
-`off`), `completed` (agent re-check chạy xong), `fallback` (agent re-check
-lỗi/timeout → giữ output gốc). Mọi field mới thêm phải đi qua `merge_structured`.
-Đổi tên field / event / route là **breaking change** — phải nêu rõ và migrate.
+`final_output_check.status`: `skipped` (attempt 0 đạt schema hoặc `mode=off`) ·
+`completed` (một re-check ra JSON hợp lệ) · `exhausted` (hết `MAX_ATTEMPTS`) ·
+`fallback` (agent turn liên tục không chạy được). Mọi field mới thêm phải đi qua
+`merge_structured`. Đổi tên field / event / route là **breaking change**.
 
 ---
 
@@ -671,7 +683,10 @@ lỗi/timeout → giữ output gốc). Mọi field mới thêm phải đi qua `m
 | `STRUCTURED_RUNS_UPSTREAM` | `http://127.0.0.1:8642` | Hermes API server thật |
 | `HERMES_HOME` | `~/.hermes` | Nơi có `state.db` + state file |
 | `STRUCTURED_RUNS_MAX_OUTPUT_CHARS` | `200000` | Giới hạn raw output đưa vào finalizer |
-| `STRUCTURED_RUNS_FINAL_CHECK_MODE` | `auto` | `auto` = chỉ chạy agent re-check khi first-pass không hợp schema; `always` = luôn chạy (legacy); `off` = không bao giờ |
+| `STRUCTURED_RUNS_FINAL_CHECK_MODE` | `auto` | `auto` = re-check khi cần; `always` = ít nhất 1 re-check/run; `off` = không bao giờ |
+| `STRUCTURED_RUNS_FINAL_CHECK_MAX_ATTEMPTS` | `3` | Số re-check agent turn tối đa (attempt 0 không tính). **Clamp `[0, 7]`** |
+| `STRUCTURED_RUNS_FINAL_CHECK_STOP_ON_FALLBACK` | `2` | Dừng loop sau ngần này re-check fallback liên tiếp (`0` = tắt) |
+| `STRUCTURED_RUNS_FINAL_CHECK_TEXT_PREVIEW_CHARS` | `500` | Độ dài `finalizer_text_preview` mỗi history entry |
 | `STRUCTURED_RUNS_FINAL_CHECK_TIMEOUT_S` | `120` | Thời gian tối đa cho lượt agent check |
 | `STRUCTURED_RUNS_FINAL_CHECK_POLL_INTERVAL_S` | `1` | Nhịp poll lượt check |
 | `STRUCTURED_RUNS_SESSION_SETTLE_TIMEOUT_S` | `180` | Chờ tối đa cho delegation của session settle |
@@ -714,8 +729,9 @@ lỗi/timeout → giữ output gốc). Mọi field mới thêm phải đi qua `m
    `enrich_media_urls` (chỉ sửa `*_url` có sẵn & rỗng).
 9. **`_finalize.py`**: `final_output_check_prompt` (tiếng Việt — cố ý),
    `run_output_text`, `merge_structured`, `_extract_json` (một lượt finalizer,
-   không đụng registry), `post_completion_final_check`, `finalize_structured`
-   (7 bước ở §6, với fast-path/escalate theo `FINAL_CHECK_MODE`).
+   không đụng registry), `post_completion_final_check(attempt, prior_error)`,
+   `finalize_structured` (7 bước ở §6: attempt 0 + re-check loop tối đa 7 theo
+   `FINAL_CHECK_MODE` / `FINAL_CHECK_MAX_ATTEMPTS`, ghi `final_output_check.history`).
    `finalize_structured` nhận `llm` làm tham số, không đóng closure trên `ctx`.
 10. **`_events.py`**: `RunEventLog` (buffer + `_subs` fan-out + `subscribe(after_seq)`
     có keepalive), `ensure_log(run_id, headers, llm)` (idempotent, 1 drainer/run),

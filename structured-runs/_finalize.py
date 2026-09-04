@@ -2,13 +2,18 @@
 
 After the upstream run reaches a terminal state the wrapper:
   1. waits for this session's background delegations to deliver;
-  2. runs one more agent turn in the same session to correct the final answer
-     against the client JSON Schema (``post_completion_final_check``);
-  3. converts that answer to schema-valid JSON via ``llm.complete_structured``;
+  2. attempt 0: converts the agent's own final answer to schema-valid JSON via
+     ``llm.complete_structured``;
+  3. if that is not schema-valid (mode ``auto``) or always (mode ``always``),
+     loops up to ``FINAL_CHECK_MAX_ATTEMPTS`` (hard cap 7) agent re-check turns
+     in the same session (``post_completion_final_check``), feeding the last
+     validation error back into each retry prompt;
   4. canonicalizes ``*_path`` values and enriches ``*_url`` fields.
 
-A failed / expired step 2 always falls back to the original completed output --
-it can never erase a valid upstream result.
+Every attempt is recorded in ``final_output_check.history``. A failed / expired
+re-check falls back to the original completed output -- it can never erase a
+valid result. If a re-check ever produces valid JSON that result is committed
+(``resolved_on_attempt``); otherwise ``status`` is ``exhausted`` / ``fallback``.
 """
 from __future__ import annotations
 
@@ -29,7 +34,14 @@ from ._config import _now
 logger = logging.getLogger("structured-runs")
 
 
-def final_output_check_prompt(schema: Dict[str, Any], verified_artifacts: Optional[List[str]] = None) -> str:
+def final_output_check_prompt(
+    schema: Dict[str, Any],
+    verified_artifacts: Optional[List[str]] = None,
+    *,
+    attempt: int = 1,
+    prior_error: Optional[str] = None,
+    prior_parsed_preview: Optional[str] = None,
+) -> str:
     """Build a schema-aware, post-completion correction request for the agent.
 
     Deliberately sent as a follow-up API run in the same session after the
@@ -37,11 +49,26 @@ def final_output_check_prompt(schema: Dict[str, Any], verified_artifacts: Option
     artifact type: every client-provided JSON Schema gets the same final-output
     check, while artifact/file fields receive explicit MEDIA path guidance.
 
+    ``attempt`` / ``prior_error`` / ``prior_parsed_preview`` add retry context
+    when an earlier finalize pass still failed validation.
+
     Note: this prompt is intentionally written in Vietnamese -- it serves the
     Vietnamese end users of this deployment. Keep it that way when editing.
     """
     schema_text = json.dumps(schema, ensure_ascii=False, separators=(",", ":"))
-    prompt = (
+    retry_prefix = ""
+    if prior_error:
+        retry_prefix = (
+            f"ĐÂY LÀ LẦN SỬA THỨ {attempt}. Finalizer VẪN chưa tạo được JSON hợp lệ từ câu trả lời trước.\n"
+            f"Lỗi validate gần nhất: {prior_error}\n"
+        )
+        if prior_parsed_preview:
+            retry_prefix += f"JSON finalizer vừa tạo (CHƯA ĐẠT): {prior_parsed_preview}\n"
+        retry_prefix += (
+            "Tập trung sửa ĐÚNG field gây lỗi ở trên. ĐỪNG lặp lại y hệt câu trả lời cũ. "
+            "Nếu một field bắt buộc thực sự không có dữ liệu, nói rõ TÊN FIELD và LÝ DO.\n\n---\n\n"
+        )
+    prompt = retry_prefix + (
         "BƯỚC KIỂM TRA OUTPUT CUỐI — BẮT BUỘC. Bạn vừa hoàn thành tác vụ ở lượt trước. "
         "Hãy tự rà soát câu trả lời cuối theo JSON Schema của client bên dưới, rồi trả lại "
         "MỘT câu trả lời cuối đã được sửa để finalizer có thể điền đúng mọi field bắt buộc. "
@@ -105,6 +132,10 @@ async def post_completion_final_check(
     schema: Dict[str, Any],
     headers: Dict[str, str],
     verified_artifacts: Optional[List[str]] = None,
+    *,
+    attempt: int = 1,
+    prior_error: Optional[str] = None,
+    prior_parsed_preview: Optional[str] = None,
 ) -> Tuple[str, Dict[str, Any]]:
     """Ask the completed upstream agent to produce a corrected final answer.
 
@@ -114,7 +145,13 @@ async def post_completion_final_check(
     """
     original_output = run_output_text(upstream_status)
     session_id = upstream_status.get("session_id") or run_id
-    prompt = final_output_check_prompt(schema, verified_artifacts)
+    prompt = final_output_check_prompt(
+        schema,
+        verified_artifacts,
+        attempt=attempt,
+        prior_error=prior_error,
+        prior_parsed_preview=prior_parsed_preview,
+    )
     prompt += "\n\nCâu trả lời cuối trước khi kiểm tra:\n" + original_output[: cfg.MAX_OUTPUT_CHARS]
     followup_headers = dict(headers)
     followup_headers["Content-Type"] = "application/json"
@@ -128,6 +165,7 @@ async def post_completion_final_check(
     if status >= 400 or not started.get("run_id"):
         return original_output, {
             "status": "fallback",
+            "run_id": None,
             "error": f"final_output_check_start_failed: {started}",
         }
 
@@ -257,42 +295,114 @@ async def finalize_structured(
     def _clip(text: str) -> str:
         return text[: cfg.MAX_OUTPUT_CHARS]
 
+    def _preview(text: Optional[str]) -> Optional[str]:
+        n = cfg.FINAL_CHECK_TEXT_PREVIEW_CHARS
+        return text[:n] if text and n > 0 else None
+
+    def _ok(ex: Dict[str, Any]) -> bool:
+        return ex["exc"] is None and (
+            not schema_mod.validation_available() or ex["validation_error"] is None
+        )
+
+    def _history_entry(attempt: int, kind: str, ex: Dict[str, Any], rc: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        return {
+            "attempt": attempt,
+            "kind": kind,
+            "recheck_run_id": rc.get("run_id") if rc else None,
+            "recheck_status": rc.get("status") if rc else None,
+            "recheck_error": rc.get("error") if rc else None,
+            "outcome": "valid" if _ok(ex) else ("finalizer_error" if ex["exc"] else "invalid"),
+            "validation_error": str(ex["exc"]) if ex["exc"] else ex["validation_error"],
+            "finalizer_text_preview": _preview(getattr(ex["result"], "text", None)) if ex["result"] else None,
+        }
+
     mode = cfg.FINAL_CHECK_MODE  # "auto" | "always" | "off"
-    extract: Dict[str, Any] = {}
-    final_check: Optional[Dict[str, Any]] = None
+    max_attempts = cfg.FINAL_CHECK_MAX_ATTEMPTS
+    history: List[Dict[str, Any]] = []
+    attempts_run = 0
+    consecutive_fallback = 0
+    last_recheck_run_id: Optional[str] = None
 
-    # Fast path (auto/off): finalize the agent's own output directly. Only when
-    # that is not schema-valid (auto) do we spend a whole extra agent turn on
-    # the "BƯỚC KIỂM TRA OUTPUT CUỐI" re-check.
-    if mode != "always":
-        extract = await _extract_json(
-            llm, run_id, _clip(original_output + artifact_suffix), schema, schema_name
-        )
-        first_pass_ok = (
-            extract["exc"] is None
-            and schema_mod.validation_available()
-            and extract["validation_error"] is None
-        )
-        if mode == "off" or first_pass_ok:
-            final_check = {
-                "status": "skipped",
-                "reason": "first_pass_schema_valid" if first_pass_ok else "final_check_disabled",
-            }
+    def _preview_parsed(ex: Dict[str, Any]) -> Optional[str]:
+        if ex["parsed"] is None:
+            return None
+        return _preview(json.dumps(ex["parsed"], ensure_ascii=False))
 
-    # Escalation path: run the post-completion agent re-check, then finalize the
-    # corrected answer.
-    if final_check is None:
-        logger.info(
-            "[structured-runs] Running post-completion output check for %s (artifacts=%d)",
-            run_id,
-            len(verified_artifacts),
-        )
-        checked_output, final_check = await post_completion_final_check(
-            run_id, upstream_status, schema, headers, verified_artifacts
-        )
-        extract = await _extract_json(
-            llm, run_id, _clip(checked_output + artifact_suffix), schema, schema_name
-        )
+    def _err_text(ex: Dict[str, Any]) -> Optional[str]:
+        return str(ex["exc"]) if ex["exc"] else ex["validation_error"]
+
+    # Attempt 0: finalize the agent's own output directly (no agent turn).
+    extract = await _extract_json(
+        llm, run_id, _clip(original_output + artifact_suffix), schema, schema_name
+    )
+    history.append(_history_entry(0, "agent_output", extract, None))
+    committed = extract if _ok(extract) else None
+    resolved_on_attempt = 0 if committed is not None else None
+    stopped_on_fallback = False
+
+    if mode == "off":
+        fc_status, fc_reason = "skipped", "final_check_disabled"
+    elif mode == "auto" and committed is not None:
+        fc_status, fc_reason = "skipped", "first_pass_schema_valid"
+    else:
+        fc_reason = None
+        prior_error = _err_text(extract)
+        prior_preview = _preview_parsed(extract)
+        # 'always' runs at least one re-check even if attempt 0 was valid.
+        need_more = mode == "always" or committed is None
+        while need_more and attempts_run < max_attempts:
+            n = attempts_run + 1
+            logger.info(
+                "[structured-runs] Post-completion output check for %s attempt %d/%d",
+                run_id, n, max_attempts,
+            )
+            checked_output, rc = await post_completion_final_check(
+                run_id, upstream_status, schema, headers, verified_artifacts,
+                attempt=n, prior_error=prior_error, prior_parsed_preview=prior_preview,
+            )
+            attempts_run = n
+            last_recheck_run_id = rc.get("run_id") or last_recheck_run_id
+            extract = await _extract_json(
+                llm, run_id, _clip(checked_output + artifact_suffix), schema, schema_name
+            )
+            history.append(_history_entry(n, "agent_recheck", extract, rc))
+            if _ok(extract):
+                committed = extract
+                resolved_on_attempt = n
+                break
+            prior_error = _err_text(extract)
+            prior_preview = _preview_parsed(extract)
+            if rc.get("status") == "fallback":
+                consecutive_fallback += 1
+                if (
+                    cfg.FINAL_CHECK_STOP_ON_FALLBACK
+                    and consecutive_fallback >= cfg.FINAL_CHECK_STOP_ON_FALLBACK
+                ):
+                    stopped_on_fallback = True
+                    break
+            else:
+                consecutive_fallback = 0
+            need_more = committed is None
+
+        if committed is not None:
+            fc_status = "completed"
+        elif stopped_on_fallback:
+            fc_status = "fallback"
+        else:
+            fc_status = "exhausted"
+
+    # Commit the valid attempt if we found one, else the last attempt tried.
+    if committed is not None:
+        extract = committed
+    final_check = {
+        "status": fc_status,
+        "reason": fc_reason,
+        "recheck_attempts": attempts_run,
+        "resolved_on_attempt": resolved_on_attempt,
+        "last_recheck_run_id": last_recheck_run_id,
+        "run_id": last_recheck_run_id,  # back-compat alias
+        "history": history,
+    }
 
     with _state.LOCK:
         if run_id in _state.runs:

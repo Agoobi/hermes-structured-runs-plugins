@@ -477,12 +477,35 @@
       },
       "FinalOutputCheck": {
         "type": "object",
-        "description": "Kết quả bước post-completion. `skipped` = fast path đạt schema hoặc `FINAL_CHECK_MODE=off`; `completed` = agent re-check chạy xong; `fallback` = re-check lỗi/timeout, giữ output gốc.",
+        "description": "Kết quả bước post-completion + toàn bộ lịch sử attempt. Attempt 0 = finalize output gốc của agent (không agent turn); attempt 1..N = re-check agent turn, tối đa `STRUCTURED_RUNS_FINAL_CHECK_MAX_ATTEMPTS` (clamp [0,7]).",
         "properties": {
-          "status": { "type": "string", "enum": ["skipped", "completed", "fallback"] },
-          "reason": { "type": "string", "enum": ["first_pass_schema_valid", "final_check_disabled"] },
-          "run_id": { "type": "string" },
-          "error": { "type": "string" }
+          "status": {
+            "type": "string",
+            "enum": ["skipped", "completed", "exhausted", "fallback"],
+            "description": "`skipped` = attempt 0 đạt schema hoặc `mode=off`; `completed` = một re-check ra JSON hợp lệ; `exhausted` = hết MAX_ATTEMPTS vẫn lệch (`structured_status=failed`); `fallback` = dừng sớm vì agent turn liên tục không chạy được."
+          },
+          "reason": { "type": ["string", "null"], "enum": ["first_pass_schema_valid", "final_check_disabled", null] },
+          "recheck_attempts": { "type": "integer", "description": "Số re-check agent turn đã chạy." },
+          "resolved_on_attempt": { "type": ["integer", "null"], "description": "Attempt (0..N) tạo ra JSON hợp lệ được commit; null nếu không attempt nào đạt." },
+          "last_recheck_run_id": { "type": ["string", "null"] },
+          "run_id": { "type": ["string", "null"], "description": "Alias của `last_recheck_run_id` (giữ cho client cũ)." },
+          "history": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/FinalOutputCheckAttempt" }
+          }
+        }
+      },
+      "FinalOutputCheckAttempt": {
+        "type": "object",
+        "properties": {
+          "attempt": { "type": "integer" },
+          "kind": { "type": "string", "enum": ["agent_output", "agent_recheck"] },
+          "recheck_run_id": { "type": ["string", "null"] },
+          "recheck_status": { "type": ["string", "null"], "enum": ["completed", "fallback", null] },
+          "recheck_error": { "type": ["string", "null"] },
+          "outcome": { "type": "string", "enum": ["valid", "invalid", "finalizer_error"] },
+          "validation_error": { "type": ["string", "null"] },
+          "finalizer_text_preview": { "type": ["string", "null"], "description": "Chars đầu của text finalizer tạo ra (độ dài = `STRUCTURED_RUNS_FINAL_CHECK_TEXT_PREVIEW_CHARS`)." }
         }
       },
       "SessionSettle": {

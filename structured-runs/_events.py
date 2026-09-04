@@ -332,5 +332,7 @@ async def _finalize_terminal(
         "structured_model": merged.get("structured_model"),
         "structured_usage": merged.get("structured_usage"),
         "structured_error": merged.get("structured_error"),
+        "structured_validation": merged.get("structured_validation"),
+        "final_output_check": merged.get("final_output_check"),
     }
     return log.append(name, payload)

@@ -27,6 +27,18 @@ if FINAL_CHECK_MODE not in {"auto", "always", "off"}:
     FINAL_CHECK_MODE = "auto"
 FINAL_CHECK_TIMEOUT_S = float(os.getenv("STRUCTURED_RUNS_FINAL_CHECK_TIMEOUT_S", "120"))
 FINAL_CHECK_POLL_INTERVAL_S = float(os.getenv("STRUCTURED_RUNS_FINAL_CHECK_POLL_INTERVAL_S", "1"))
+# Max agent re-check turns when the finalizer output is still not schema-valid.
+# Attempt 0 (finalizing the agent's own output, no agent turn) does not count.
+# Hard-clamped to [0, 7]: each attempt is an agent turn + a complete_structured call.
+_FINAL_CHECK_MAX_ATTEMPTS_CAP = 7
+FINAL_CHECK_MAX_ATTEMPTS = max(
+    0, min(int(os.getenv("STRUCTURED_RUNS_FINAL_CHECK_MAX_ATTEMPTS", "3")), _FINAL_CHECK_MAX_ATTEMPTS_CAP)
+)
+# Stop the re-check loop early after this many consecutive re-checks whose agent
+# turn could not run (fallback). 0 disables the early stop.
+FINAL_CHECK_STOP_ON_FALLBACK = max(0, int(os.getenv("STRUCTURED_RUNS_FINAL_CHECK_STOP_ON_FALLBACK", "2")))
+# How much of each attempt's raw finalizer text to keep in final_output_check.history.
+FINAL_CHECK_TEXT_PREVIEW_CHARS = max(0, int(os.getenv("STRUCTURED_RUNS_FINAL_CHECK_TEXT_PREVIEW_CHARS", "500")))
 SESSION_SETTLE_TIMEOUT_S = float(os.getenv("STRUCTURED_RUNS_SESSION_SETTLE_TIMEOUT_S", "180"))
 SESSION_QUIET_S = float(os.getenv("STRUCTURED_RUNS_SESSION_QUIET_S", "3"))
 SESSION_SETTLE_POLL_INTERVAL_S = float(os.getenv("STRUCTURED_RUNS_SESSION_SETTLE_POLL_INTERVAL_S", "1"))

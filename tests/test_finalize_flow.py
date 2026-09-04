@@ -51,8 +51,11 @@ class FinalizeFlowTests(unittest.IsolatedAsyncioTestCase):
         async def _no_settle(run_id):
             return {"status": "unavailable"}
 
-        async def _no_check(run_id, upstream_status, schema, headers, verified_artifacts=None):
-            return _finalize.run_output_text(upstream_status), {"status": "fallback", "error": "stub"}
+        async def _no_check(run_id, upstream_status, schema, headers, verified_artifacts=None,
+                            *, attempt=1, prior_error=None, prior_parsed_preview=None):
+            return _finalize.run_output_text(upstream_status), {
+                "status": "fallback", "run_id": None, "error": "stub",
+            }
 
         _session_db.wait_for_session_settle = _no_settle
         _session_db.latest_session_output = lambda run_id: None
